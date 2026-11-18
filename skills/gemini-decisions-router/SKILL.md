@@ -9,13 +9,14 @@ This plugin connects Antigravity to the Gemini Decisions API (`gemini-decision-1
 
 ## MCP Tools
 
-The bundled MCP server registers two tools under the `gemini-decisions-router_decisions` namespace:
+The bundled MCP server registers three tools under the `gemini-decisions-router_decisions` namespace:
 
 1. `create_decision`: Evaluates shared text or local files once across up to 64 independent questions of three types:
    - `noul`: Binary yes/no question returning calibrated `P(yes)` in `[0.01, 0.99]`, boolean `value`, and `confidence` in `[0, 1]`.
    - `choice`: Discrete multiple-choice map (2 to 255 options) returning `choice`, `confidence`, and normalized `probabilities`.
    - `score`: Ordered rubric array (2 to 255 levels, index `0..N-1`) returning expected `score`, modal `level`, `confidence`, and per-level `probabilities`.
 2. `route_prompt`: Classifies a prompt or subagent task using Tier 0 (`<1 ms`) fast rules plus a single-pass `create_decision` call, returning `recommended_tier` (`flash_lite`, `flash`, `pro`), `recommended_model_id`, `thinking_level`, and `confidence`.
+3. `list_models`: Lists all available target models, their Antigravity model enums, default thinking levels, and the active `tier_models` configuration.
 
 ## Lifecycle Hooks
 
@@ -41,6 +42,12 @@ python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py route \
 # Switch mode: advisor (default), auto_switch, or off
 python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py set-mode advisor
 python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py set-mode auto_switch
+
+# Inspect all available target models and active tier assignments
+python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py list-models
+
+# Customize target models per tier (or pass --reset for defaults)
+python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py set-models --pro claude-sonnet-4-6
 
 # Inspect recent routing telemetry and average latency
 python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py stats
