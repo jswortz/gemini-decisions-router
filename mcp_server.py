@@ -125,6 +125,47 @@ _ROUTE_PROMPT_TOOL: dict[str, Any] = {
 }
 
 
+_LIST_MODELS_TOOL: dict[str, Any] = {
+    "name": "list_models",
+    "description": (
+        "List all available target models supported by the router, their"
+        " Antigravity model enums, default thinking levels, and the currently"
+        " configured tier_models mapping (`flash_lite`, `flash`, `pro`)."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {},
+    },
+    "annotations": {"readOnlyHint": True, "openWorldHint": False},
+}
+
+
+def _load_router_model_config() -> tuple[dict[str, str], dict[str, str]]:
+  cfg_path = (
+      os.path.expanduser("~/.config/gemini-decisions-router/router_config.json")
+  )
+  tier_models: dict[str, str] = {}
+  custom_enums: dict[str, str] = {}
+  try:
+    with open(cfg_path, encoding="utf-8") as f:
+      loaded = json.load(f)
+    if isinstance(loaded, dict):
+      if isinstance(loaded.get("tier_models"), dict):
+        tier_models = {
+            str(k): str(v) for k, v in loaded["tier_models"].items() if v
+        }
+      if isinstance(loaded.get("custom_model_enums"), dict):
+        custom_enums = {
+            str(k): str(v)
+            for k, v in loaded["custom_model_enums"].items()
+            if v
+        }
+  except (OSError, ValueError):
+    pass
+  return tier_models, custom_enums
+
+
 def _reject_json_constant(token: str) -> Any:
   raise ValueError(f"Non-standard JSON constant rejected: {token}")
 
@@ -237,7 +278,8 @@ class McpServer:
 
     if method == "tools/list":
       return self._ok(
-          req_id, {"tools": [_CREATE_DECISION_TOOL, _ROUTE_PROMPT_TOOL]}
+          req_id,
+          {"tools": [_CREATE_DECISION_TOOL, _ROUTE_PROMPT_TOOL, _LIST_MODELS_TOOL]},
       )
 
     if method == "tools/call":
@@ -262,13 +304,22 @@ class McpServer:
           raise decisions_engine.InvalidInputError(
               "prompt must be a non-empty string"
           )
-        res = self._route_fn(
-            prompt,
-            current_model=str(arguments.get("current_model") or "auto"),
-            user_turn_count=max(1, int(arguments.get("user_turn_count") or 1)),
-            prev_context=str(arguments.get("prev_context") or ""),
-            enable_fast_rules=bool(arguments.get("enable_fast_rules", True)),
-            settings=self._settings,
+        tier_models, _ = _load_router_model_config()
+        route_kwargs: dict[str, Any] = {
+            "current_model": str(arguments.get("current_model") or "auto"),
+            "user_turn_count": max(1, int(arguments.get("user_turn_count") or 1)),
+            "prev_context": str(arguments.get("prev_context") or ""),
+            "enable_fast_rules": bool(arguments.get("enable_fast_rules", True)),
+            "settings": self._settings,
+        }
+        if self._route_fn is decisions_engine.route_prompt:
+          route_kwargs["tier_models"] = tier_models
+        res = self._route_fn(prompt, **route_kwargs)
+      elif name == "list_models":
+        tier_models, custom_enums = _load_router_model_config()
+        res = decisions_engine.list_available_target_models(
+            tier_models=tier_models,
+            custom_model_enums=custom_enums,
         )
       else:
         return self._err(req_id, _INVALID_PARAMS, f"unknown tool: {name}")

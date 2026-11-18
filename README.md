@@ -86,6 +86,8 @@ python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py auth-che
 
 Never store `GEMINI_API_KEY` or OAuth tokens in `config.json`; the plugin rejects config files containing secret keys.
 
+See [docs/API_KEY_QUICKSTART.md](docs/API_KEY_QUICKSTART.md) for a full walkthrough of `GEMINI_API_KEY` installation, hook/MCP routing, and live telemetry.
+
 ## Router Modes
 
 The plugin supports three operating modes:
@@ -166,6 +168,8 @@ python3 -m pytest -v tests/test_external_plugin.py
 - `skills/gemini-decisions-router/SKILL.md`: Agent skill instructions loaded by Antigravity
 - `docs/CUSTOMER_ONBOARDING.md`: Enterprise Google Cloud customer rollout guide
 - `docs/AUTHENTICATION_ADC.md`: Keyless ADC architecture and troubleshooting guide
+- `docs/API_KEY_QUICKSTART.md`: `GEMINI_API_KEY` install, hook/MCP routing, and telemetry walkthrough
+- `docs/AUTO_ROUTING_TEST_STRATEGY.md`: Configurable target model catalog, auto-routing test strategy, and live `telemetry.jsonl` evaluation results
 - `tests/test_external_plugin.py`: Unit, mock HTTP, security boundary, and repository hygiene test suite
 
 ## License

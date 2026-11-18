@@ -1439,11 +1439,206 @@ def create_decision(
 # ---- 2-Tier Calibrated Model Router -----------------------------------------
 
 TIER_RANKS = {"flash_lite": 1, "flash": 2, "pro": 3}
-TIER_MODELS = {
+
+AVAILABLE_TARGET_MODELS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "gemini-3.1-flash-lite",
+        "label": "Gemini 3.1 Flash-Lite",
+        "provider": "google",
+        "tier": "flash_lite",
+        "enum": "MODEL_GOOGLE_GEMINI_3_1_FLASH_LITE",
+        "default_thinking_level": 1,
+        "description": "Fastest, lowest-cost model for lookups, confirmations, and lightweight subagents.",
+    },
+    {
+        "id": "gemini-3-flash",
+        "label": "Gemini 3 Flash",
+        "provider": "google",
+        "tier": "flash",
+        "enum": "MODEL_GOOGLE_GEMINI_3_0_FLASH",
+        "default_thinking_level": 2,
+        "description": "Balanced speed and coding quality for edits, refactors, tests, and docs.",
+    },
+    {
+        "id": "gemini-3.1-pro-low",
+        "label": "Gemini 3.1 Pro (Low)",
+        "provider": "google",
+        "tier": "pro",
+        "enum": "MODEL_GOOGLE_GEMINI_3_1_PRO_LOW",
+        "default_thinking_level": 2,
+        "description": "Pro reasoning with lower thinking budget for faster architectural tasks.",
+    },
+    {
+        "id": "gemini-3.1-pro-high",
+        "label": "Gemini 3.1 Pro (High)",
+        "provider": "google",
+        "tier": "pro",
+        "enum": "MODEL_GOOGLE_GEMINI_3_1_PRO",
+        "default_thinking_level": 4,
+        "description": "Frontier multi-step reasoning for system architecture, concurrency, and security.",
+    },
+    {
+        "id": "gemini-2.5-flash-lite",
+        "label": "Gemini 2.5 Flash-Lite",
+        "provider": "google",
+        "tier": "flash_lite",
+        "enum": "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE",
+        "default_thinking_level": 1,
+        "description": "Gemini 2.5 ultra-fast lightweight target model.",
+    },
+    {
+        "id": "gemini-2.5-flash",
+        "label": "Gemini 2.5 Flash",
+        "provider": "google",
+        "tier": "flash",
+        "enum": "MODEL_GOOGLE_GEMINI_2_5_FLASH",
+        "default_thinking_level": 2,
+        "description": "Gemini 2.5 balanced speed and reasoning target model.",
+    },
+    {
+        "id": "gemini-2.5-pro",
+        "label": "Gemini 2.5 Pro",
+        "provider": "google",
+        "tier": "pro",
+        "enum": "MODEL_GOOGLE_GEMINI_2_5_PRO",
+        "default_thinking_level": 3,
+        "description": "Gemini 2.5 high-capability reasoning target model.",
+    },
+    {
+        "id": "claude-sonnet-4-6",
+        "label": "Claude Sonnet 4.6 (Thinking)",
+        "provider": "anthropic",
+        "tier": "pro",
+        "enum": "MODEL_CLAUDE_4_6_SONNET_THINKING",
+        "default_thinking_level": 3,
+        "description": "Anthropic Claude Sonnet 4.6 target model in Antigravity.",
+    },
+    {
+        "id": "claude-opus-4-6",
+        "label": "Claude Opus 4.6 (Thinking)",
+        "provider": "anthropic",
+        "tier": "pro",
+        "enum": "MODEL_CLAUDE_4_6_OPUS_THINKING",
+        "default_thinking_level": 4,
+        "description": "Anthropic Claude Opus 4.6 frontier reasoning target model in Antigravity.",
+    },
+    {
+        "id": "gpt-oss-120b-medium",
+        "label": "GPT-OSS 120B (Medium)",
+        "provider": "openai",
+        "tier": "flash",
+        "enum": "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
+        "default_thinking_level": 2,
+        "description": "Open-weight 120B target model in Antigravity.",
+    },
+)
+
+MODEL_ENUMS: dict[str, str] = {
+    m["id"]: str(m["enum"]) for m in AVAILABLE_TARGET_MODELS
+}
+
+DEFAULT_TIER_MODELS: dict[str, str] = {
     "flash_lite": "gemini-3.1-flash-lite",
     "flash": "gemini-3-flash",
     "pro": "gemini-3.1-pro-high",
 }
+TIER_MODELS = dict(DEFAULT_TIER_MODELS)
+
+TIER_ENV_VARS: dict[str, str] = {
+    "flash_lite": "GEMINI_DECISIONS_MODEL_FLASH_LITE",
+    "flash": "GEMINI_DECISIONS_MODEL_FLASH",
+    "pro": "GEMINI_DECISIONS_MODEL_PRO",
+}
+
+
+def resolve_tier_models(
+    tier_models: Mapping[str, str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+  """Resolves active tier -> target model ID mapping (defaults < config < env)."""
+  resolved = dict(DEFAULT_TIER_MODELS)
+  if isinstance(tier_models, Mapping):
+    for tier in TIER_RANKS:
+      val = str(tier_models.get(tier) or "").strip()
+      if val:
+        resolved[tier] = val
+  env = os.environ if environ is None else environ
+  for tier, env_key in TIER_ENV_VARS.items():
+    val = str(env.get(env_key) or "").strip()
+    if val:
+      resolved[tier] = val
+  return resolved
+
+
+def list_available_target_models(
+    *,
+    tier_models: Mapping[str, str] | None = None,
+    custom_model_enums: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+  """Returns all catalog and custom target models plus active tier assignments."""
+  active = resolve_tier_models(tier_models, environ=environ)
+  assigned_by_model: dict[str, list[str]] = {}
+  for tier, model_id in active.items():
+    assigned_by_model.setdefault(model_id, []).append(tier)
+
+  models: list[dict[str, Any]] = []
+  seen_ids: set[str] = set()
+  for entry in AVAILABLE_TARGET_MODELS:
+    mid = str(entry["id"])
+    seen_ids.add(mid)
+    item = dict(entry)
+    item["assigned_tiers"] = assigned_by_model.get(mid, [])
+    item["custom"] = False
+    models.append(item)
+
+  if isinstance(custom_model_enums, Mapping):
+    for mid_raw, enum_raw in custom_model_enums.items():
+      mid = str(mid_raw or "").strip()
+      enum_val = str(enum_raw or "").strip()
+      if not mid or mid in seen_ids:
+        continue
+      seen_ids.add(mid)
+      models.append({
+          "id": mid,
+          "label": mid,
+          "provider": "custom",
+          "tier": (assigned_by_model.get(mid) or ["custom"])[0],
+          "enum": enum_val,
+          "default_thinking_level": 2,
+          "description": "User-configured custom target model.",
+          "assigned_tiers": assigned_by_model.get(mid, []),
+          "custom": True,
+      })
+
+  for tier, mid in active.items():
+    if mid not in seen_ids:
+      seen_ids.add(mid)
+      models.append({
+          "id": mid,
+          "label": mid,
+          "provider": "custom",
+          "tier": tier,
+          "enum": "",
+          "default_thinking_level": 2,
+          "description": "User-configured target model override.",
+          "assigned_tiers": assigned_by_model.get(mid, []),
+          "custom": True,
+      })
+
+  env = os.environ if environ is None else environ
+  env_overrides = {
+      tier: str(env.get(env_key)).strip()
+      for tier, env_key in TIER_ENV_VARS.items()
+      if str(env.get(env_key) or "").strip()
+  }
+  return {
+      "active_tier_models": active,
+      "default_tier_models": dict(DEFAULT_TIER_MODELS),
+      "env_overrides": env_overrides,
+      "available_target_models": models,
+  }
 THINKING_LABELS = {1: "Low", 2: "Medium", 3: "High", 4: "Max"}
 
 _SHORT_CONFIRMATIONS = frozenset({
@@ -1560,13 +1755,15 @@ def _build_route_dict(
     thread_lock_applied: bool = False,
     explicit_model_requested: bool = False,
     probabilities: Mapping[str, Any] | None = None,
+    tier_models: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
   t_lvl = max(1, min(4, int(thinking_level)))
+  models = tier_models or TIER_MODELS
   return {
       "task_class": task_class,
       "recommended_tier": tier,
       "subagent_tier": tier,
-      "recommended_model_id": TIER_MODELS[tier],
+      "recommended_model_id": str(models.get(tier) or TIER_MODELS[tier]),
       "tier_rank": TIER_RANKS[tier],
       "thinking_level": t_lvl,
       "thinking_label": THINKING_LABELS[t_lvl],
@@ -1585,6 +1782,7 @@ def _apply_thread_floor(
     *,
     user_turn_count: int,
     thread_state: Mapping[str, Any] | None,
+    tier_models: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
   """Prevents mid-thread model downgrades on Turn 2+ unless user overrode."""
   if (
@@ -1598,6 +1796,7 @@ def _apply_thread_floor(
   if locked_tier not in TIER_RANKS:
     return candidate
 
+  models = tier_models or TIER_MODELS
   if TIER_RANKS[locked_tier] > TIER_RANKS[candidate["subagent_tier"]]:
     locked_think = max(
         int(thread_state.get("locked_thinking_level", 2)),
@@ -1607,7 +1806,9 @@ def _apply_thread_floor(
     out["recommended_tier"] = locked_tier
     out["subagent_tier"] = locked_tier
     out["recommended_model_id"] = str(
-        thread_state.get("locked_model_id") or TIER_MODELS[locked_tier]
+        thread_state.get("locked_model_id")
+        or models.get(locked_tier)
+        or TIER_MODELS[locked_tier]
     )
     out["tier_rank"] = TIER_RANKS[locked_tier]
     out["thinking_level"] = locked_think
@@ -1626,6 +1827,7 @@ def _fast_rule_route(
     *,
     user_turn_count: int,
     thread_state: Mapping[str, Any] | None,
+    tier_models: Mapping[str, str] | None = None,
 ) -> dict[str, Any] | None:
   cleaned = re.sub(r"\s+", " ", prompt).strip()
   low = cleaned.lower().rstrip(".!")
@@ -1647,6 +1849,7 @@ def _fast_rule_route(
           latency_ms=1,
           rationale=f"User explicitly requested {explicit_tier} tier.",
           explicit_model_requested=True,
+          tier_models=tier_models,
       )
 
   if (
@@ -1658,7 +1861,7 @@ def _fast_rule_route(
     if locked_tier not in TIER_RANKS:
       locked_tier = "flash"
     locked_think = int(thread_state.get("locked_thinking_level", 2))
-    return _build_route_dict(
+    out = _build_route_dict(
         task_class=str(thread_state.get("locked_task_class") or "coding_edit"),
         tier=locked_tier,
         thinking_level=locked_think,
@@ -1670,7 +1873,11 @@ def _fast_rule_route(
             f" {locked_tier} floor."
         ),
         thread_lock_applied=True,
+        tier_models=tier_models,
     )
+    if thread_state.get("locked_model_id"):
+      out["recommended_model_id"] = str(thread_state["locked_model_id"])
+    return out
 
   if low in _SHORT_CONFIRMATIONS:
     return _build_route_dict(
@@ -1681,6 +1888,7 @@ def _fast_rule_route(
         backend="fast_rules (<1 ms)",
         latency_ms=1,
         rationale="Short operational confirmation or status ping.",
+        tier_models=tier_models,
     )
 
   if any(
@@ -1695,12 +1903,15 @@ def _fast_rule_route(
         backend="fast_rules (<1 ms)",
         latency_ms=1,
         rationale="Concurrency/crash diagnostic marker detected.",
+        tier_models=tier_models,
     )
 
   return None
 
 
-def _lexical_fallback_route(prompt: str) -> dict[str, Any]:
+def _lexical_fallback_route(
+    prompt: str, *, tier_models: Mapping[str, str] | None = None
+) -> dict[str, Any]:
   low = prompt.lower()
   words = low.split()
   if any(
@@ -1724,6 +1935,7 @@ def _lexical_fallback_route(prompt: str) -> dict[str, Any]:
         backend="lexical_fallback (<1 ms)",
         latency_ms=1,
         rationale="Offline lexical fallback matched architecture/security terms.",
+        tier_models=tier_models,
     )
   if any(
       k in low
@@ -1750,6 +1962,7 @@ def _lexical_fallback_route(prompt: str) -> dict[str, Any]:
         backend="lexical_fallback (<1 ms)",
         latency_ms=1,
         rationale="Offline lexical fallback matched implementation/doc terms.",
+        tier_models=tier_models,
     )
   return _build_route_dict(
       task_class="quick_lookup",
@@ -1759,6 +1972,7 @@ def _lexical_fallback_route(prompt: str) -> dict[str, Any]:
       backend="lexical_fallback (<1 ms)",
       latency_ms=1,
       rationale="Offline lexical fallback default route.",
+      tier_models=tier_models,
   )
 
 
@@ -1808,9 +2022,12 @@ def route_prompt(
     settings: Settings | None = None,
     environ: Mapping[str, str] | None = None,
     decision_fn: Callable[..., dict[str, Any]] | None = None,
+    tier_models: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
   """Scores a prompt via Tier 0 fast rules + Tier 1 Gemini Decisions API."""
   del current_model  # Reserved for future catalog-aware cost comparison
+  env = os.environ if environ is None else environ
+  resolved_models = resolve_tier_models(tier_models, environ=env)
   text = (prompt or "").strip()
   if not text:
     return _build_route_dict(
@@ -1821,15 +2038,22 @@ def route_prompt(
         backend="fast_rules (<1 ms)",
         latency_ms=0,
         rationale="Empty prompt.",
+        tier_models=resolved_models,
     )
 
   if enable_fast_rules:
     fast = _fast_rule_route(
-        text, user_turn_count=user_turn_count, thread_state=thread_state
+        text,
+        user_turn_count=user_turn_count,
+        thread_state=thread_state,
+        tier_models=resolved_models,
     )
     if fast is not None:
       return _apply_thread_floor(
-          fast, user_turn_count=user_turn_count, thread_state=thread_state
+          fast,
+          user_turn_count=user_turn_count,
+          thread_state=thread_state,
+          tier_models=resolved_models,
       )
 
   context_parts = []
@@ -1844,7 +2068,6 @@ def route_prompt(
     if decision_fn is not None:
       dec = decision_fn(call_args, settings)
     else:
-      env = os.environ if environ is None else environ
       cfg = settings or load_settings(environ=env)
       if not ignore_cooldown and is_api_on_cooldown(cooldown_file):
         raise UnavailableError("Decisions API on temporary 45s cooldown")
@@ -1856,9 +2079,12 @@ def route_prompt(
         trip_api_cooldown(cooldown_file)
         raise
   except DecisionError:
-    fallback = _lexical_fallback_route(text)
+    fallback = _lexical_fallback_route(text, tier_models=resolved_models)
     return _apply_thread_floor(
-        fallback, user_turn_count=user_turn_count, thread_state=thread_state
+        fallback,
+        user_turn_count=user_turn_count,
+        thread_state=thread_state,
+        tier_models=resolved_models,
     )
 
   answers = dec["answers"]
@@ -1906,7 +2132,11 @@ def route_prompt(
           "needs_pro_reasoning": p_pro,
           "effort_score": eff_score,
       },
+      tier_models=resolved_models,
   )
   return _apply_thread_floor(
-      candidate, user_turn_count=user_turn_count, thread_state=thread_state
+      candidate,
+      user_turn_count=user_turn_count,
+      thread_state=thread_state,
+      tier_models=resolved_models,
   )

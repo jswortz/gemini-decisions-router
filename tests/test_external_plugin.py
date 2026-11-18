@@ -399,6 +399,7 @@ def test_mcp_and_hooks_end_to_end(tmp_path: pathlib.Path) -> None:
   assert {t["name"] for t in tools_resp["result"]["tools"]} == {
       "create_decision",
       "route_prompt",
+      "list_models",
   }
 
   cfg_path = tmp_path / "router_config.json"
@@ -433,6 +434,16 @@ def test_mcp_and_hooks_end_to_end(tmp_path: pathlib.Path) -> None:
       config_path=cfg_path,
   )
   assert out_sub == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
+
+  telemetry_lines = [
+      json.loads(line)
+      for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+      if line.strip()
+  ]
+  assert telemetry_lines[0]["event"] == "PreInvocation"
+  assert telemetry_lines[0]["prompt"] == "ship it"
+  assert telemetry_lines[1]["event"] == "PreToolUse:invoke_subagent"
+  assert telemetry_lines[1]["prompt"] == "ship it"
 
 
 def test_wif_env_token_and_vertex_model_prefix_normalization() -> None:
@@ -560,11 +571,342 @@ def test_choice_and_score_validation_and_safety_blocks() -> None:
     )
 
 
+def test_list_and_configure_target_models(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Verifies target model catalog listing, config overrides, and env overrides."""
+  catalog = decisions_engine.list_available_target_models(environ={})
+  model_ids = {m["id"] for m in catalog["available_target_models"]}
+  assert {
+      "gemini-3.1-flash-lite",
+      "gemini-3-flash",
+      "gemini-3.1-pro-low",
+      "gemini-3.1-pro-high",
+      "gemini-2.5-flash-lite",
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+      "claude-sonnet-4-6",
+      "claude-opus-4-6",
+      "gpt-oss-120b-medium",
+  }.issubset(model_ids)
+  assert catalog["active_tier_models"] == {
+      "flash_lite": "gemini-3.1-flash-lite",
+      "flash": "gemini-3-flash",
+      "pro": "gemini-3.1-pro-high",
+  }
+
+  # Config file overrides + custom model enum
+  cfg_path = tmp_path / "router_config.json"
+  router_hook.save_router_config(
+      {
+          "mode": "advisor",
+          "tier_models": {
+              "flash_lite": "gemini-2.5-flash-lite",
+              "flash": "gemini-2.5-flash",
+              "pro": "claude-sonnet-4-6",
+          },
+          "custom_model_enums": {
+              "my-custom-pro": "MODEL_CUSTOM_PRO_V1",
+          },
+      },
+      config_path=cfg_path,
+  )
+  loaded = router_hook.load_router_config(config_path=cfg_path)
+  assert loaded["tier_models"]["pro"] == "claude-sonnet-4-6"
+  assert router_hook.resolve_model_enums(loaded)["my-custom-pro"] == (
+      "MODEL_CUSTOM_PRO_V1"
+  )
+
+  # PreInvocation routes to configured custom target model
+  out_pre = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "cfg-model-conv",
+          "invocationNum": 1,
+          "modelName": "auto",
+          "lastUserInput": "use gemini pro to audit this auth flow",
+      },
+      state_dir=tmp_path,
+      config_path=cfg_path,
+  )
+  title = out_pre["injectSteps"][0]["systemMessage"]["renderInfo"]["title"]
+  assert "claude-sonnet-4-6" in title
+
+  # Environment variable override takes precedence over config
+  monkeypatch.setenv("GEMINI_DECISIONS_MODEL_PRO", "gemini-2.5-pro")
+  loaded_env = router_hook.load_router_config(config_path=cfg_path)
+  assert loaded_env["tier_models"]["pro"] == "gemini-2.5-pro"
+
+  # MCP list_models tool returns the full catalog
+  srv = mcp_server.McpServer()
+  resp = json.loads(
+      srv.handle_line(
+          json.dumps({
+              "jsonrpc": "2.0",
+              "id": 9,
+              "method": "tools/call",
+              "params": {"name": "list_models", "arguments": {}},
+          }).encode("utf-8")
+      ).decode("utf-8")
+  )
+  assert resp["result"]["isError"] is False
+  sc = resp["result"]["structuredContent"]
+  assert len(sc["available_target_models"]) >= 10
+  assert sc["active_tier_models"]["pro"] == "gemini-2.5-pro"
+
+
+def test_auto_routing_prompt_matrix_and_telemetry_logs(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Verifies auto_switch routing paths across a matrix of test prompts + logs."""
+  cfg_path = tmp_path / "router_config.json"
+  router_hook.save_router_config(
+      {
+          "mode": "auto_switch",
+          "min_confidence": 0.45,
+          "enable_fast_rules": True,
+          "enable_subagent_routing": True,
+      },
+      config_path=cfg_path,
+  )
+
+  dispatched: list[tuple[str, str, int]] = []
+
+  def fake_spawn(
+      conv_id: str,
+      model_enum: str,
+      thinking_level: int,
+      *,
+      allowed_enums: set[str] | None = None,
+  ) -> bool:
+    assert allowed_enums and model_enum in allowed_enums
+    dispatched.append((conv_id, model_enum, thinking_level))
+    return True
+
+  monkeypatch.setattr(router_hook, "_spawn_redispatch", fake_spawn)
+
+  def fake_decision(call_args: dict[str, Any], _cfg: Any) -> dict[str, Any]:
+    txt = str(call_args["input"][-1]["text"]).lower()
+    if "capital of france" in txt or "markdown files" in txt:
+      return {
+          "backend": "gemini_api",
+          "model": "gemini-decision-1",
+          "latency_ms": 180,
+          "answers": {
+              "task_class": {
+                  "choice": "quick_lookup",
+                  "confidence": 0.96,
+                  "probabilities": {"quick_lookup": 0.99},
+              },
+              "needs_pro_reasoning": {"noul": 0.02, "confidence": 0.96},
+              "effort_rubric": {"score": 0.25, "confidence": 0.94},
+          },
+      }
+    if "fastapi" in txt or "refactor" in txt:
+      return {
+          "backend": "gemini_api",
+          "model": "gemini-decision-1",
+          "latency_ms": 205,
+          "answers": {
+              "task_class": {
+                  "choice": "coding_edit",
+                  "confidence": 0.92,
+                  "probabilities": {"coding_edit": 0.98},
+              },
+              "needs_pro_reasoning": {"noul": 0.12, "confidence": 0.90},
+              "effort_rubric": {"score": 1.75, "confidence": 0.88},
+          },
+      }
+    return {
+        "backend": "gemini_api",
+        "model": "gemini-decision-1",
+        "latency_ms": 290,
+        "answers": {
+            "task_class": {
+                "choice": "deep_debug_architecture",
+                "confidence": 0.93,
+                "probabilities": {"deep_debug_architecture": 0.94},
+            },
+            "needs_pro_reasoning": {"noul": 0.95, "confidence": 0.92},
+            "effort_rubric": {"score": 2.85, "confidence": 0.90},
+        },
+    }
+
+  def route_with_mock(prompt: str, **kwargs: Any) -> dict[str, Any]:
+    return decisions_engine.route_prompt(
+        prompt, decision_fn=fake_decision, **kwargs
+    )
+
+  cases = [
+      (
+          "conv-t0-confirm",
+          1,
+          "ship it",
+          "flash_lite",
+          "gemini-3.1-flash-lite",
+          "fast_rules (<1 ms)",
+      ),
+      (
+          "conv-t0-override",
+          1,
+          "use gemini pro to review this design",
+          "pro",
+          "gemini-3.1-pro-high",
+          "fast_rules (<1 ms)",
+      ),
+      (
+          "conv-t1-lite",
+          1,
+          "What is the capital of France?",
+          "flash_lite",
+          "gemini-3.1-flash-lite",
+          "gemini_api",
+      ),
+      (
+          "conv-t1-flash",
+          1,
+          "Refactor this FastAPI endpoint to validate pagination parameters",
+          "flash",
+          "gemini-3-flash",
+          "gemini_api",
+      ),
+      (
+          "conv-t1-pro",
+          1,
+          "Design a multi-region Cloud Spanner schema with conflict-free failover",
+          "pro",
+          "gemini-3.1-pro-high",
+          "gemini_api",
+      ),
+      (
+          "conv-t1-pro",
+          2,
+          "yes go ahead",
+          "pro",
+          "gemini-3.1-pro-high",
+          "thread_lock (<1 ms)",
+      ),
+  ]
+
+  for conv_id, inv_num, prompt, _exp_tier, _exp_model, _exp_backend in cases:
+    out = router_hook.handle_pre_invocation(
+        {
+            "conversationId": conv_id,
+            "invocationNum": inv_num,
+            "modelName": "auto",
+            "lastUserInput": prompt,
+        },
+        state_dir=tmp_path,
+        config_path=cfg_path,
+        route_fn=route_with_mock,
+    )
+    assert out == {"terminationBehavior": "terminate"}
+
+  sub_out = router_hook.handle_pre_tool_use(
+      {
+          "conversationId": "conv-t1-pro",
+          "lastUserInput": "list docs",
+          "toolCall": {
+              "name": "invoke_subagent",
+              "args": {
+                  "TypeName": "research",
+                  "Role": "Codebase Researcher",
+                  "Prompt": "List the markdown files in docs/",
+                  "Model": "inherit",
+              },
+          },
+      },
+      state_dir=tmp_path,
+      config_path=cfg_path,
+      route_fn=route_with_mock,
+  )
+  assert sub_out == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
+
+  rows = [
+      json.loads(line)
+      for line in (tmp_path / "telemetry.jsonl")
+      .read_text(encoding="utf-8")
+      .splitlines()
+      if line.strip()
+  ]
+  assert len(rows) == len(cases) + 1
+  for idx, (_cid, _inv, prompt, exp_tier, exp_model, exp_backend) in enumerate(
+      cases
+  ):
+    row = rows[idx]
+    assert row["event"] == "PreInvocation"
+    assert row["mode"] == "auto_switch"
+    assert row["did_auto_switch"] is True
+    assert row["prompt"] == prompt
+    assert row["subagent_tier"] == exp_tier
+    assert row["recommended_model_id"] == exp_model
+    assert row["backend"] == exp_backend
+
+  sub_row = rows[-1]
+  assert sub_row["event"] == "PreToolUse:invoke_subagent"
+  assert sub_row["assigned_tier"] == "flash_lite"
+  assert sub_row["prompt"] == "List the markdown files in docs/"
+  assert len(dispatched) == len(cases)
+
+
+def test_auto_switch_prevents_multi_step_loop(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Ensures auto_switch fires once per prompt even if current_model never changes."""
+  cfg_path = tmp_path / "router_config.json"
+  cfg_path.write_text(
+      json.dumps({"mode": "auto_switch", "min_confidence": 0.45}),
+      encoding="utf-8",
+  )
+  redispatch_calls: list[tuple[str, str, int]] = []
+
+  def fake_redispatch(
+      conv_id: str,
+      model_enum: str,
+      thinking_level: int,
+      *,
+      allowed_enums: set[str] | None = None,
+  ) -> bool:
+    del allowed_enums
+    redispatch_calls.append((conv_id, model_enum, thinking_level))
+    return True
+
+  monkeypatch.setattr(router_hook, "_spawn_redispatch", fake_redispatch)
+
+  hook_payload = {
+      "conversationId": "loop-test-conv",
+      "invocationNum": 1,
+      "modelName": "custom-unmapped-model",
+      "lastUserInput": "ship it",
+  }
+
+  step1 = router_hook.handle_pre_invocation(
+      hook_payload, state_dir=tmp_path, config_path=cfg_path
+  )
+  assert step1 == {"terminationBehavior": "terminate"}
+  assert len(redispatch_calls) == 1
+
+  step2 = router_hook.handle_pre_invocation(
+      hook_payload, state_dir=tmp_path, config_path=cfg_path
+  )
+  assert "Auto-Switched:" in (
+      step2["injectSteps"][0]["systemMessage"]["renderInfo"]["title"]
+  )
+  assert len(redispatch_calls) == 1
+
+  step3 = router_hook.handle_pre_invocation(
+      hook_payload, state_dir=tmp_path, config_path=cfg_path
+  )
+  assert step3 == {}
+  assert len(redispatch_calls) == 1
+
+
 def test_docs_contain_no_em_or_en_dashes() -> None:
   doc_paths = [
       REPO_ROOT / "README.md",
       REPO_ROOT / "docs" / "CUSTOMER_ONBOARDING.md",
       REPO_ROOT / "docs" / "AUTHENTICATION_ADC.md",
+      REPO_ROOT / "docs" / "API_KEY_QUICKSTART.md",
+      REPO_ROOT / "docs" / "TESTING_STRATEGY.md",
       REPO_ROOT / "skills" / "gemini-decisions-router" / "SKILL.md",
   ]
   for doc in doc_paths:

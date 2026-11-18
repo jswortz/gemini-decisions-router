@@ -36,18 +36,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import decisions_engine  # noqa: E402
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_SAFE_ENUM_RE = re.compile(r"^[A-Z0-9_]{3,96}$")
 
-MODEL_ENUMS = {
-    "gemini-3.1-flash-lite": "MODEL_GOOGLE_GEMINI_3_1_FLASH_LITE",
-    "gemini-3-flash": "MODEL_GOOGLE_GEMINI_3_0_FLASH",
-    "gemini-3.1-pro-high": "MODEL_GOOGLE_GEMINI_3_1_PRO",
-}
+MODEL_ENUMS: dict[str, str] = dict(decisions_engine.MODEL_ENUMS)
 
 DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "mode": "advisor",  # "advisor" | "auto_switch" | "off"
     "min_confidence": 0.45,
     "enable_fast_rules": True,
     "enable_subagent_routing": True,
+    "tier_models": dict(decisions_engine.DEFAULT_TIER_MODELS),
+    "custom_model_enums": {},
 }
 
 
@@ -84,21 +83,48 @@ def safe_state_path(
 def load_router_config(
     config_path: pathlib.Path | None = None,
 ) -> dict[str, Any]:
-  cfg = dict(DEFAULT_ROUTER_CONFIG)
+  cfg = {
+      **DEFAULT_ROUTER_CONFIG,
+      "tier_models": dict(decisions_engine.DEFAULT_TIER_MODELS),
+      "custom_model_enums": {},
+  }
   p = config_path or default_router_config_path()
   if p.is_file():
     try:
       loaded = json.loads(p.read_text(encoding="utf-8"))
       if isinstance(loaded, dict):
         for k in DEFAULT_ROUTER_CONFIG:
-          if k in loaded:
+          if k not in loaded:
+            continue
+          if k == "tier_models" and isinstance(loaded[k], dict):
+            cfg["tier_models"] = decisions_engine.resolve_tier_models(
+                loaded[k], environ={}
+            )
+          elif k == "custom_model_enums" and isinstance(loaded[k], dict):
+            cfg["custom_model_enums"] = {
+                str(mid).strip(): str(enum_val).strip()
+                for mid, enum_val in loaded[k].items()
+                if str(mid).strip()
+                and _SAFE_ENUM_RE.fullmatch(str(enum_val).strip())
+            }
+          else:
             cfg[k] = loaded[k]
     except (OSError, ValueError):
       pass
+  cfg["tier_models"] = decisions_engine.resolve_tier_models(cfg["tier_models"])
   env_mode = os.environ.get("GEMINI_DECISIONS_ROUTER_MODE", "").strip().lower()
   if env_mode in ("advisor", "auto_switch", "off"):
     cfg["mode"] = env_mode
   return cfg
+
+
+def resolve_model_enums(cfg: dict[str, Any] | None = None) -> dict[str, str]:
+  enums = dict(MODEL_ENUMS)
+  if isinstance(cfg, dict) and isinstance(cfg.get("custom_model_enums"), dict):
+    for mid, enum_val in cfg["custom_model_enums"].items():
+      if str(mid).strip() and _SAFE_ENUM_RE.fullmatch(str(enum_val).strip()):
+        enums[str(mid).strip()] = str(enum_val).strip()
+  return enums
 
 
 def save_router_config(
@@ -192,12 +218,17 @@ def _ls_rpc(
 
 
 def _spawn_redispatch(
-    conversation_id: str, model_enum: str, thinking_level: int
+    conversation_id: str,
+    model_enum: str,
+    thinking_level: int,
+    *,
+    allowed_enums: set[str] | None = None,
 ) -> bool:
   addr, csrf = _discover_ls_endpoint()
   if not addr or not csrf or not conversation_id or not model_enum:
     return False
-  if model_enum not in MODEL_ENUMS.values():
+  valid_enums = allowed_enums or set(MODEL_ENUMS.values())
+  if model_enum not in valid_enums:
     return False
   child_env = dict(os.environ)
   child_env["ANTIGRAVITY_LS_ADDRESS"] = addr
@@ -233,6 +264,14 @@ def _clean_user_prompt(raw: str) -> str:
   )
   txt = re.sub(r"</?USER_REQUEST>", " ", txt)
   return re.sub(r"\s+", " ", txt).strip()
+
+
+def _prompt_preview(text: str, max_len: int = 160) -> str:
+  """Returns a single-line truncated prompt preview for telemetry."""
+  collapsed = re.sub(r"\s+", " ", text or "").strip()
+  if len(collapsed) <= max_len:
+    return collapsed
+  return collapsed[: max_len - 3].rstrip() + "..."
 
 
 def _build_render_info(
@@ -295,15 +334,21 @@ def handle_pre_invocation(
   turn_num = max(1, int(raw_inv)) if isinstance(raw_inv, int) else 1
 
   reroute_file = safe_state_path(sdir, conv_id, "reroute")
-  reroute_hit = _load_json_state(reroute_file, max_age_s=60.0)
+  reroute_hit = _load_json_state(reroute_file, max_age_s=600.0)
   prompt_hash = hashlib.sha256(
       cleaned.encode("utf-8", "ignore")
   ).hexdigest()[:16]
   if reroute_hit and reroute_hit.get("prompt_hash") == prompt_hash:
-    try:
-      reroute_file.unlink(missing_ok=True)
-    except OSError:
-      pass
+    if reroute_hit.get("rendered"):
+      return {}
+    _save_json_state(
+        reroute_file,
+        {
+            "prompt_hash": prompt_hash,
+            "render_info": reroute_hit.get("render_info") or {},
+            "rendered": True,
+        },
+    )
     render_info = reroute_hit.get("render_info") or {}
     if render_info:
       return {
@@ -321,17 +366,20 @@ def handle_pre_invocation(
   if thread_state and turn_num == 1:
     turn_num = int(thread_state.get("turn_count_seen", 1)) + 1
 
-  route = route_fn(
-      cleaned,
-      current_model=model_name,
-      user_turn_count=turn_num,
-      thread_state=thread_state,
-      enable_fast_rules=bool(cfg.get("enable_fast_rules", True)),
-  )
+  route_kwargs: dict[str, Any] = {
+      "current_model": model_name,
+      "user_turn_count": turn_num,
+      "thread_state": thread_state,
+      "enable_fast_rules": bool(cfg.get("enable_fast_rules", True)),
+  }
+  if route_fn is decisions_engine.route_prompt:
+    route_kwargs["tier_models"] = cfg.get("tier_models")
+  route = route_fn(cleaned, **route_kwargs)
 
   min_conf = float(cfg.get("min_confidence", 0.45))
   target_id = str(route["recommended_model_id"])
-  target_enum = MODEL_ENUMS.get(target_id, "")
+  enums_map = resolve_model_enums(cfg)
+  target_enum = enums_map.get(target_id, "")
   should_switch = (
       mode == "auto_switch"
       and bool(target_enum)
@@ -347,10 +395,17 @@ def handle_pre_invocation(
   if should_switch:
     _save_json_state(
         reroute_file,
-        {"prompt_hash": prompt_hash, "render_info": render_info},
+        {
+            "prompt_hash": prompt_hash,
+            "render_info": render_info,
+            "rendered": False,
+        },
     )
     did_switch = _spawn_redispatch(
-        conv_id, target_enum, int(route["thinking_level"])
+        conv_id,
+        target_enum,
+        int(route["thinking_level"]),
+        allowed_enums=set(enums_map.values()),
     )
     if not did_switch:
       render_info = _build_render_info(
@@ -381,6 +436,7 @@ def handle_pre_invocation(
       {
           "ts": datetime.now(timezone.utc).isoformat(),
           "event": "PreInvocation",
+          "prompt": _prompt_preview(cleaned),
           "mode": mode,
           "did_auto_switch": did_switch,
           "current_model": model_name,
@@ -468,6 +524,7 @@ def handle_pre_tool_use(
           "ts": datetime.now(timezone.utc).isoformat(),
           "event": "PreToolUse:invoke_subagent",
           "role": sub_role[:80],
+          "prompt": _prompt_preview(sub_prompt),
           "assigned_tier": tier,
           "task_class": sub_route.get("task_class"),
           "confidence": sub_route.get("confidence"),
@@ -542,12 +599,14 @@ def _cmd_redispatch(ns: argparse.Namespace) -> int:
 
 
 def _cmd_route(ns: argparse.Namespace) -> int:
+  rcfg = load_router_config()
   res = decisions_engine.route_prompt(
       ns.prompt,
       current_model=ns.current_model,
       user_turn_count=ns.turns,
       enable_fast_rules=not ns.no_fast_rules,
       ignore_cooldown=ns.no_fast_rules,
+      tier_models=rcfg.get("tier_models"),
   )
   sys.stdout.write(json.dumps(res, indent=2, ensure_ascii=False) + "\n")
   return 0
@@ -642,14 +701,86 @@ def _cmd_status() -> int:
     backend_info = {"error": e.to_dict()}
 
   ls_addr, _ = _discover_ls_endpoint()
+  catalog = decisions_engine.list_available_target_models(
+      tier_models=rcfg.get("tier_models"),
+      custom_model_enums=rcfg.get("custom_model_enums"),
+  )
   out = {
       "router_config_path": str(default_router_config_path()),
       "router_config": rcfg,
+      "available_target_models": [
+          m["id"] for m in catalog["available_target_models"]
+      ],
       "decisions_backend": backend_info,
       "language_server_detected": bool(ls_addr),
       "state_dir": str(default_state_dir()),
   }
   sys.stdout.write(json.dumps(out, indent=2) + "\n")
+  return 0
+
+
+def _cmd_list_models() -> int:
+  rcfg = load_router_config()
+  catalog = decisions_engine.list_available_target_models(
+      tier_models=rcfg.get("tier_models"),
+      custom_model_enums=rcfg.get("custom_model_enums"),
+  )
+  sys.stdout.write(json.dumps(catalog, indent=2) + "\n")
+  return 0
+
+
+def _cmd_set_models(ns: argparse.Namespace) -> int:
+  rcfg = load_router_config()
+  tier_models = (
+      dict(decisions_engine.DEFAULT_TIER_MODELS)
+      if ns.reset
+      else dict(rcfg.get("tier_models") or decisions_engine.DEFAULT_TIER_MODELS)
+  )
+  custom_enums = (
+      {}
+      if ns.reset
+      else dict(rcfg.get("custom_model_enums") or {})
+  )
+  if ns.flash_lite:
+    tier_models["flash_lite"] = ns.flash_lite.strip()
+  if ns.flash:
+    tier_models["flash"] = ns.flash.strip()
+  if ns.pro:
+    tier_models["pro"] = ns.pro.strip()
+  for pair in ns.custom_enum or []:
+    if "=" not in pair:
+      sys.stderr.write(
+          f"Error: --custom-enum expects MODEL_ID=MODEL_ENUM, got {pair!r}\n"
+      )
+      return 2
+    mid, enum_val = [p.strip() for p in pair.split("=", 1)]
+    if not mid or not _SAFE_ENUM_RE.fullmatch(enum_val):
+      sys.stderr.write(
+          f"Error: invalid --custom-enum {pair!r} (enum must match"
+          " ^[A-Z0-9_]{3,96}$)\n"
+      )
+      return 2
+    custom_enums[mid] = enum_val
+
+  cfg = save_router_config({
+      "tier_models": tier_models,
+      "custom_model_enums": custom_enums,
+  })
+  catalog = decisions_engine.list_available_target_models(
+      tier_models=cfg.get("tier_models"),
+      custom_model_enums=cfg.get("custom_model_enums"),
+  )
+  sys.stdout.write(
+      json.dumps(
+          {
+              "status": "updated",
+              "router_config": cfg,
+              "active_tier_models": catalog["active_tier_models"],
+          },
+          indent=2,
+      )
+      + "\n"
+  )
   return 0
 
 
@@ -731,6 +862,23 @@ def main() -> int:
   )
 
   sub.add_parser("status")
+  sub.add_parser("list-models")
+
+  p_models = sub.add_parser("set-models")
+  p_models.add_argument("--flash-lite", default=None)
+  p_models.add_argument("--flash", default=None)
+  p_models.add_argument("--pro", default=None)
+  p_models.add_argument(
+      "--custom-enum",
+      action="append",
+      default=[],
+      help="Register custom model ID to enum mapping (MODEL_ID=MODEL_ENUM).",
+  )
+  p_models.add_argument(
+      "--reset",
+      action="store_true",
+      help="Reset tier_models and custom_model_enums to defaults.",
+  )
 
   p_mode = sub.add_parser("set-mode")
   p_mode.add_argument("mode", choices=["advisor", "auto_switch", "off"])
@@ -752,6 +900,10 @@ def main() -> int:
     return _cmd_auth_check(ns)
   if ns.cmd == "status":
     return _cmd_status()
+  if ns.cmd == "list-models":
+    return _cmd_list_models()
+  if ns.cmd == "set-models":
+    return _cmd_set_models(ns)
   if ns.cmd == "set-mode":
     return _cmd_set_mode(ns)
   if ns.cmd == "stats":
