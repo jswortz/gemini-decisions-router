@@ -40,8 +40,11 @@ _SAFE_ENUM_RE = re.compile(r"^[A-Z0-9_]{3,96}$")
 
 MODEL_ENUMS: dict[str, str] = dict(decisions_engine.MODEL_ENUMS)
 
+VALID_VERBOSITY_LEVELS = ("compact", "normal", "verbose")
+
 DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "mode": "advisor",  # "advisor" | "auto_switch" | "off"
+    "verbosity": "normal",  # "compact" | "normal" | "verbose"
     "min_confidence": 0.45,
     "enable_fast_rules": True,
     "enable_subagent_routing": True,
@@ -115,6 +118,11 @@ def load_router_config(
   env_mode = os.environ.get("GEMINI_DECISIONS_ROUTER_MODE", "").strip().lower()
   if env_mode in ("advisor", "auto_switch", "off"):
     cfg["mode"] = env_mode
+  env_verb = os.environ.get("GEMINI_DECISIONS_VERBOSITY", "").strip().lower()
+  if env_verb in VALID_VERBOSITY_LEVELS:
+    cfg["verbosity"] = env_verb
+  if str(cfg.get("verbosity") or "").lower() not in VALID_VERBOSITY_LEVELS:
+    cfg["verbosity"] = "normal"
   return cfg
 
 
@@ -274,31 +282,113 @@ def _prompt_preview(text: str, max_len: int = 160) -> str:
   return collapsed[: max_len - 3].rstrip() + "..."
 
 
+def _format_intent_banner(
+    route: dict[str, Any],
+    *,
+    current_model: str,
+    switched: bool,
+    verbosity: str = "normal",
+) -> str:
+  """Builds an aesthetic 'Routed with Intent' ASCII/Unicode art header."""
+  conf_pct = int(round(float(route.get("confidence", 0.0)) * 100))
+  model_id = str(route.get("recommended_model_id") or "auto")
+  thinking = str(route.get("thinking_label") or "Medium")
+  tier = str(route.get("subagent_tier") or "flash")
+  latency = int(route.get("latency_ms", 0))
+  arrow = ">>" if switched else "->"
+  tag = "AUTO-SWITCHED" if switched else "ADVISOR"
+
+  if verbosity == "compact":
+    return (
+        f"✦ Routed with Intent {arrow} {model_id} [{thinking}]"
+        f" ({conf_pct}% | {latency} ms)"
+    )
+
+  line1 = f"  ✦  ROUTED WITH INTENT  |  {tag}  |  tier={tier}"
+  line2 = f"     {current_model}  {arrow}  {model_id} [{thinking}]  ({conf_pct}% | {latency} ms)"
+  width = max(len(line1), len(line2), 54) + 2
+  top = "╭" + "─" * width + "╮"
+  bot = "╰" + "─" * width + "╯"
+  return "\n".join([
+      top,
+      f"│{line1.ljust(width)}│",
+      f"│{line2.ljust(width)}│",
+      bot,
+  ])
+
+
 def _build_render_info(
-    route: dict[str, Any], *, current_model: str, switched: bool
+    route: dict[str, Any],
+    *,
+    current_model: str,
+    switched: bool,
+    verbosity: str = "normal",
 ) -> dict[str, str]:
+  verb = verbosity if verbosity in VALID_VERBOSITY_LEVELS else "normal"
   conf_pct = int(round(float(route.get("confidence", 0.0)) * 100))
   action = "Auto-Switched" if switched else "Recommended"
-  title = (
-      f"{action}: {route['recommended_model_id']} /"
-      f" {route['thinking_label']} effort ({conf_pct}%)"
+  model_id = str(route["recommended_model_id"])
+  thinking = str(route["thinking_label"])
+  latency = route["latency_ms"]
+
+  if verb == "compact":
+    title = f"{action}: {model_id} [{thinking}] ({conf_pct}% | {latency} ms)"
+    markdown = (
+        f"✦ **Routed with Intent** -> `{model_id}`"
+        f" (`{route['task_class']}`, {conf_pct}%,"
+        f" `{route['backend']}` in `{latency} ms`)"
+    )
+    return {
+        "titlePrefix": "✦ Routed with Intent",
+        "title": title,
+        "markdown": markdown,
+    }
+
+  title = f"{action}: {model_id} / {thinking} effort ({conf_pct}%)"
+  banner = _format_intent_banner(
+      route, current_model=current_model, switched=switched, verbosity=verb
   )
   lines = [
+      f"```text\n{banner}\n```",
       f"- **Active Dropdown Model**: `{current_model}`",
       (
-          f"- **Calibrated Route**: `{route['recommended_model_id']}`"
+          f"- **Calibrated Route**: `{model_id}`"
           f" (`subagent_tier={route['subagent_tier']}`,"
-          f" thinking=`{route['thinking_label']}`)"
+          f" thinking=`{thinking}`)"
       ),
       f"- **Task Class**: `{route['task_class']}` ({conf_pct}% confidence)",
       (
           f"- **Decision Gate**: `{route['backend']}` in"
-          f" `{route['latency_ms']} ms` (0 output tokens)"
+          f" `{latency} ms` (0 output tokens)"
       ),
       f"- **Rationale**: {route['rationale']}",
   ]
+  if verb == "verbose":
+    probs = route.get("probabilities") or {}
+    if probs:
+      tc_probs = probs.get("task_class") or {}
+      if isinstance(tc_probs, dict) and tc_probs:
+        top_tc = ", ".join(
+            f"{k}={v:.2f}"
+            for k, v in sorted(
+                tc_probs.items(), key=lambda kv: kv[1], reverse=True
+            )[:4]
+        )
+        lines.append(f"- **Class Probabilities**: `{top_tc}`")
+      if "needs_pro_reasoning" in probs:
+        lines.append(
+            f"- **P(pro reasoning)**: `{float(probs['needs_pro_reasoning']):.3f}`"
+        )
+      if "effort_score" in probs:
+        lines.append(
+            f"- **Effort Rubric**: `{float(probs['effort_score']):.2f} / 3.0`"
+        )
+    lines.append(
+        f"- **Thread Lock**: `{bool(route.get('thread_lock_applied'))}`"
+        f" | **Explicit Request**: `{bool(route.get('explicit_model_requested'))}`"
+    )
   return {
-      "titlePrefix": "Gemini Decisions Router",
+      "titlePrefix": "✦ Routed with Intent",
       "title": title,
       "markdown": "\n".join(lines),
   }
@@ -388,8 +478,12 @@ def handle_pre_invocation(
   )
 
   did_switch = False
+  verbosity = str(cfg.get("verbosity") or "normal")
   render_info = _build_render_info(
-      route, current_model=model_name, switched=should_switch
+      route,
+      current_model=model_name,
+      switched=should_switch,
+      verbosity=verbosity,
   )
 
   if should_switch:
@@ -409,7 +503,7 @@ def handle_pre_invocation(
     )
     if not did_switch:
       render_info = _build_render_info(
-          route, current_model=model_name, switched=False
+          route, current_model=model_name, switched=False, verbosity=verbosity
       )
 
   _save_json_state(
@@ -608,6 +702,27 @@ def _cmd_route(ns: argparse.Namespace) -> int:
       ignore_cooldown=ns.no_fast_rules,
       tier_models=rcfg.get("tier_models"),
   )
+  verb = ns.verbosity or str(rcfg.get("verbosity") or "normal")
+  if ns.pretty or ns.verbosity is not None:
+    banner = _format_intent_banner(
+        res,
+        current_model=ns.current_model,
+        switched=False,
+        verbosity=verb,
+    )
+    lines = [banner]
+    if verb in ("normal", "verbose"):
+      lines.append(
+          f"  Task: {res['task_class']}  |  Backend: {res['backend']}"
+          f"  |  Latency: {res['latency_ms']} ms"
+      )
+      lines.append(f"  Rationale: {res['rationale']}")
+    if verb == "verbose":
+      probs = res.get("probabilities") or {}
+      if probs:
+        lines.append(f"  Probabilities: {json.dumps(probs)}")
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
   sys.stdout.write(json.dumps(res, indent=2, ensure_ascii=False) + "\n")
   return 0
 
@@ -788,11 +903,76 @@ def _cmd_set_mode(ns: argparse.Namespace) -> int:
   updates: dict[str, Any] = {"mode": ns.mode}
   if ns.min_confidence is not None:
     updates["min_confidence"] = float(ns.min_confidence)
+  if getattr(ns, "verbosity", None) is not None:
+    updates["verbosity"] = ns.verbosity
   cfg = save_router_config(updates)
   sys.stdout.write(
       json.dumps({"status": "updated", "router_config": cfg}, indent=2) + "\n"
   )
   return 0
+
+
+def _cmd_set_verbosity(ns: argparse.Namespace) -> int:
+  cfg = save_router_config({"verbosity": ns.verbosity})
+  sys.stdout.write(
+      json.dumps({"status": "updated", "router_config": cfg}, indent=2) + "\n"
+  )
+  return 0
+
+
+def _format_stats_pretty(
+    recent: list[dict[str, Any]],
+    *,
+    by_tier: dict[str, int],
+    avg_ms: int,
+    verbosity: str,
+) -> str:
+  """Formats recent telemetry events with 'Routed with Intent' CLI aesthetics."""
+  tail = recent[-10:] if verbosity == "verbose" else recent[-5:]
+  if verbosity == "compact":
+    lines = [
+        f"✦ Routed with Intent | events={len(recent)} avg={avg_ms}ms tiers={by_tier}"
+    ]
+    for r in tail:
+      target = r.get("recommended_model_id") or r.get("assigned_tier") or "?"
+      prompt = _prompt_preview(str(r.get("prompt") or ""), max_len=60)
+      lat = r.get("latency_ms", 0)
+      sw = ">>" if r.get("did_auto_switch") else "->"
+      lines.append(f"  {sw} {target:<22} ({lat:>3} ms)  {prompt}")
+    return "\n".join(lines)
+
+  tier_summary = "  ".join(f"{k}:{v}" for k, v in sorted(by_tier.items()))
+  header1 = "  ✦  ROUTED WITH INTENT  |  GEMINI DECISIONS TELEMETRY"
+  header2 = f"     events={len(recent)}   avg_latency={avg_ms} ms   {tier_summary}"
+  w = max(len(header1), len(header2), 62) + 2
+  lines = [
+      "╭" + "─" * w + "╮",
+      f"│{header1.ljust(w)}│",
+      f"│{header2.ljust(w)}│",
+      "╰" + "─" * w + "╯",
+  ]
+  for r in tail:
+    ts = str(r.get("ts") or "")[11:19]
+    ev = "SUB" if "PreToolUse" in str(r.get("event") or "") else "TURN"
+    target = str(r.get("recommended_model_id") or r.get("assigned_tier") or "?")
+    tier = str(r.get("subagent_tier") or r.get("assigned_tier") or "?")
+    backend = str(r.get("backend") or "?")
+    lat = r.get("latency_ms", 0)
+    sw = "SWITCH" if r.get("did_auto_switch") else "ADVISE"
+    prompt = _prompt_preview(str(r.get("prompt") or ""), max_len=72)
+    lines.append(
+        f"  [{ts}] {ev:<4} {sw:<6} -> {target:<22} [{tier:<10}] {lat:>3} ms"
+    )
+    if prompt:
+      lines.append(f"           prompt: \"{prompt}\"")
+    if verbosity == "verbose":
+      lines.append(
+          f"           from={r.get('current_model', 'auto')}"
+          f"  task={r.get('task_class', '?')}"
+          f"  conf={r.get('confidence', '?')}"
+          f"  backend={backend}"
+      )
+  return "\n".join(lines)
 
 
 def _cmd_stats(ns: argparse.Namespace) -> int:
@@ -820,6 +1000,16 @@ def _cmd_stats(ns: argparse.Namespace) -> int:
     if isinstance(r.get("latency_ms"), int):
       latencies.append(r["latency_ms"])
   avg_ms = int(round(sum(latencies) / len(latencies))) if latencies else 0
+  if not getattr(ns, "as_json", False):
+    rcfg = load_router_config()
+    verb = getattr(ns, "verbosity", None) or str(rcfg.get("verbosity") or "normal")
+    sys.stdout.write(
+        _format_stats_pretty(
+            recent, by_tier=by_tier, avg_ms=avg_ms, verbosity=verb
+        )
+        + "\n"
+    )
+    return 0
   sys.stdout.write(
       json.dumps(
           {
@@ -853,6 +1043,10 @@ def main() -> int:
   p_route.add_argument("--current-model", default="auto")
   p_route.add_argument("--turns", type=int, default=1)
   p_route.add_argument("--no-fast-rules", action="store_true")
+  p_route.add_argument("--pretty", action="store_true")
+  p_route.add_argument(
+      "--verbosity", choices=list(VALID_VERBOSITY_LEVELS), default=None
+  )
 
   p_auth = sub.add_parser("auth-check")
   p_auth.add_argument(
@@ -883,9 +1077,19 @@ def main() -> int:
   p_mode = sub.add_parser("set-mode")
   p_mode.add_argument("mode", choices=["advisor", "auto_switch", "off"])
   p_mode.add_argument("--min-confidence", type=float, default=None)
+  p_mode.add_argument(
+      "--verbosity", choices=list(VALID_VERBOSITY_LEVELS), default=None
+  )
+
+  p_verb = sub.add_parser("set-verbosity")
+  p_verb.add_argument("verbosity", choices=list(VALID_VERBOSITY_LEVELS))
 
   p_stats = sub.add_parser("stats")
   p_stats.add_argument("--limit", type=int, default=50)
+  p_stats.add_argument(
+      "--verbosity", choices=list(VALID_VERBOSITY_LEVELS), default=None
+  )
+  p_stats.add_argument("--json", dest="as_json", action="store_true")
 
   ns = parser.parse_args()
   if ns.cmd in (None, "pre-invocation"):
@@ -906,6 +1110,8 @@ def main() -> int:
     return _cmd_set_models(ns)
   if ns.cmd == "set-mode":
     return _cmd_set_mode(ns)
+  if ns.cmd == "set-verbosity":
+    return _cmd_set_verbosity(ns)
   if ns.cmd == "stats":
     return _cmd_stats(ns)
   return 0

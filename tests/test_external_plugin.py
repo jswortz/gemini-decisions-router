@@ -900,6 +900,58 @@ def test_auto_switch_prevents_multi_step_loop(
   assert len(redispatch_calls) == 1
 
 
+def test_verbosity_levels_and_routed_with_intent_aesthetics(
+    tmp_path: pathlib.Path,
+) -> None:
+  """Verifies compact, normal, and verbose 'Routed with Intent' rendering."""
+  route = {
+      "task_class": "deep_debug_architecture",
+      "recommended_tier": "pro",
+      "subagent_tier": "pro",
+      "recommended_model_id": "gemini-3.1-pro-high",
+      "tier_rank": 3,
+      "thinking_level": 4,
+      "thinking_label": "Max",
+      "confidence": 0.9133,
+      "backend": "gemini_api",
+      "latency_ms": 320,
+      "rationale": "task=deep_debug_architecture, P(pro)=0.95",
+      "thread_lock_applied": False,
+      "explicit_model_requested": False,
+      "probabilities": {
+          "task_class": {"deep_debug_architecture": 0.92, "coding_edit": 0.04},
+          "needs_pro_reasoning": 0.95,
+          "effort_score": 2.83,
+      },
+  }
+  compact = router_hook._build_render_info(
+      route, current_model="auto", switched=True, verbosity="compact"
+  )
+  assert compact["titlePrefix"] == "✦ Routed with Intent"
+  assert "Routed with Intent" in compact["markdown"]
+  assert "╭" not in compact["markdown"]
+
+  normal = router_hook._build_render_info(
+      route, current_model="auto", switched=False, verbosity="normal"
+  )
+  assert normal["titlePrefix"] == "✦ Routed with Intent"
+  assert "ROUTED WITH INTENT" in normal["markdown"]
+  assert "Class Probabilities" not in normal["markdown"]
+
+  verbose = router_hook._build_render_info(
+      route, current_model="auto", switched=True, verbosity="verbose"
+  )
+  assert "ROUTED WITH INTENT" in verbose["markdown"]
+  assert "Class Probabilities" in verbose["markdown"]
+  assert "P(pro reasoning)" in verbose["markdown"]
+
+  cfg_path = tmp_path / "router_config.json"
+  saved = router_hook.save_router_config(
+      {"verbosity": "verbose"}, config_path=cfg_path
+  )
+  assert saved["verbosity"] == "verbose"
+
+
 def test_docs_contain_no_em_or_en_dashes() -> None:
   doc_paths = [
       REPO_ROOT / "README.md",
