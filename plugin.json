@@ -1,0 +1,25 @@
+{
+  "name": "gemini-decisions-router",
+  "displayName": "Gemini Decisions Router",
+  "version": "1.0.0",
+  "description": "Calibrated single-pass model router and Gemini Decisions API plugin for Antigravity. Scores prompts and subagent tasks in one prefill pass with zero output tokens using keyless Google Cloud Application Default Credentials (ADC) or GEMINI_API_KEY.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "Jeremy Wortz"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "gemini-decisions",
+    "gemini-decision-1",
+    "model-router",
+    "antigravity",
+    "google-cloud-adc",
+    "vertex-ai",
+    "subagent-routing"
+  ],
+  "suggestedPrompts": [
+    "Check my Gemini Decisions Router authentication status and active routing mode.",
+    "Use create_decision to score this architecture proposal across risk, intent, and effort rubrics.",
+    "Switch the Gemini Decisions Router between advisor and auto_switch mode."
+  ]
+}
