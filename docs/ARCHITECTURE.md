@@ -6,6 +6,12 @@ Instead of autoregressive JSON routing (`480-1,124 ms` to decode `20-145` output
 
 ![Architecture](../assets/architecture.png)
 
+## Live `agyr` Routing Demo
+
+![Live agyr Routing Demo](../assets/agyr.gif)
+
+Watch `agyr` route interactive CLI prompts across `flash_lite`, `flash`, and `pro` tiers in a single `gemini-decision-1` prefill pass while streaming live `SWITCH`, `ADVISE`, and subagent telemetry in `agy-router watch`.
+
 ## 1. System Topology & Component Responsibilities
 
 ```mermaid
