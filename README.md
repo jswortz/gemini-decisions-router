@@ -2,7 +2,7 @@
 
 Run `agyr` instead of `agy` to route every prompt in one zero-output-token prefill pass (`~235 ms`) via `gemini-decision-1` before launching Antigravity on the calibrated `--model` and `--effort`. Unlike autoregressive LLM routers that spend `480-1,124 ms` decoding JSON tokens, `gemini-decision-1` scores task intent (`choice`), frontier reasoning need (`noul`), and thinking effort (`score`) directly from prefill posteriors across `flash_lite`, `flash`, and `pro`.
 
-![agyr Demo](assets/agy-router-demo.gif)
+![agyr Demo](assets/agyr.gif)
 
 ## 30-Second Quickstart
 

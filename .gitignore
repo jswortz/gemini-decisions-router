@@ -25,8 +25,9 @@ htmlcov/
 venv/
 env/
 
-# OS / Editor metadata
+# OS / Editor / Raw video metadata
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+*.mov

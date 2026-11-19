@@ -118,7 +118,7 @@ agy-router set-mode auto_switch --min-confidence 0.55
 
 ## Demo & Next Steps
 
-![agyr Demo](../assets/agy-router-demo.gif)
+![agyr Demo](../assets/agyr.gif)
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md):** Mermaid architecture and sequence diagrams, Asymmetric Thread Floor, `GEMINI_DECISIONS_PRE_ROUTED` handoff, and MCP tool schemas (`create_decision`, `route_prompt`, `list_models`, `configure_router`).
 - **[AUTHENTICATION_ADC.md](AUTHENTICATION_ADC.md):** Keyless Google Cloud OAuth2 setup (`gemini_adc` and `vertex_adc`).

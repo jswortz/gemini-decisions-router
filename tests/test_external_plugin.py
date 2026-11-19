@@ -71,7 +71,7 @@ def test_zero_internal_google_references() -> None:
     parts = set(path.relative_to(REPO_ROOT).parts)
     if parts & {".git", "__pycache__", ".pytest_cache"}:
       continue
-    if path.suffix in {".pyc", ".png", ".jpg", ".ico"}:
+    if path.suffix in {".pyc", ".png", ".jpg", ".ico", ".gif", ".mov"}:
       continue
     text = path.read_text(encoding="utf-8", errors="replace")
     checked_files += 1
