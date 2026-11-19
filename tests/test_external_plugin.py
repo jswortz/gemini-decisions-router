@@ -1877,6 +1877,9 @@ def test_docs_contain_no_em_or_en_dashes() -> None:
       REPO_ROOT / "docs" / "API_KEY_QUICKSTART.md",
       REPO_ROOT / "docs" / "TESTING_STRATEGY.md",
       REPO_ROOT / "skills" / "gemini-decisions-router" / "SKILL.md",
+      REPO_ROOT / "rules" / "AGENTS.md",
+      REPO_ROOT / "agents" / "intent-router.md",
+      REPO_ROOT / "agents" / "routed-specialist.md",
   ]
   for doc in doc_paths:
     text = doc.read_text(encoding="utf-8")
@@ -2841,6 +2844,7 @@ def test_agyr_launcher_modes_and_pre_routed_handoff(
   assert "Installed routed agy launcher to:" in install_proc.stdout
   installed_plugin = plugins_dir / "gemini-decisions-router"
   assert (installed_plugin / "agents" / "intent-router.md").is_file()
+  assert (installed_plugin / "agents" / "routed-specialist.md").is_file()
   assert (installed_plugin / "rules" / "AGENTS.md").is_file()
   agyr_wrapper = bin_dir / "agyr"
   agy_router_wrapper = bin_dir / "agy-router"
@@ -3141,3 +3145,309 @@ def test_agy_router_chat_repl_multi_turn_switching(
   finally:
     server.shutdown()
     server.server_close()
+
+
+def test_honest_cli_badges_upgrade_directive_and_subagent_child_guard(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Verifies all 4 honest CLI badges, upgrade directive, and 0-call child guard."""
+  monkeypatch.setenv("GEMINI_DECISIONS_CLI_MODE", "1")
+  monkeypatch.delenv("GEMINI_DECISIONS_PRE_ROUTED", raising=False)
+
+  state_dir = tmp_path / "honest_cli_state"
+  state_dir.mkdir(parents=True)
+  cfg_path = tmp_path / "router_config.json"
+  router_hook.save_router_config(
+      {
+          "mode": "auto_switch",
+          "verbosity": "normal",
+          "cli_inline_banner": True,
+          "enable_subagent_routing": True,
+          "tier_models": {
+              "flash_lite": "gemini-5.0-flash-low",
+              "flash": "gemini-5.0-flash-medium",
+              "pro": "gemini-5.0-pro-high",
+          },
+      },
+      config_path=cfg_path,
+  )
+
+  synth_pro_route: dict[str, Any] = {
+      "recommended_model_id": "gemini-5.0-pro-high",
+      "subagent_tier": "pro",
+      "tier_rank": 3,
+      "thinking_level": 3,
+      "thinking_label": "High",
+      "task_class": "deep_debug_architecture",
+      "confidence": 0.94,
+      "latency_ms": 120,
+      "backend": "gemini_adc",
+      "rationale": "Formal concurrency proof requires pro reasoning.",
+      "probabilities": {},
+      "thread_lock_applied": False,
+      "explicit_model_requested": False,
+  }
+  synth_lite_route: dict[str, Any] = {
+      "recommended_model_id": "gemini-5.0-flash-low",
+      "subagent_tier": "flash_lite",
+      "tier_rank": 1,
+      "thinking_level": 1,
+      "thinking_label": "Low",
+      "task_class": "quick_lookup",
+      "confidence": 0.97,
+      "latency_ms": 4,
+      "backend": "fast_rules (<1 ms)",
+      "rationale": "Quick lookup.",
+      "probabilities": {},
+      "thread_lock_applied": False,
+      "explicit_model_requested": False,
+  }
+
+  # 1. All 4 CLI badge states with synthetic external-safe model IDs
+  badge_switched = router_hook._build_cli_badge_line(
+      synth_pro_route,
+      current_model="gemini-5.0-flash-low",
+      switched=True,
+  )
+  assert badge_switched == (
+      "> ✦ **Routed with Intent** (Switched -> `gemini-5.0-pro-high` [High])"
+      " · 94% · 120 ms"
+  )
+
+  badge_subagent = router_hook._build_cli_badge_line(
+      synth_pro_route,
+      current_model="gemini-5.0-flash-low",
+      switched=False,
+      delegated_upgrade=True,
+  )
+  assert badge_subagent == (
+      "> ✦ **Routed with Intent** (Subagent -> `gemini-5.0-pro-high` [High]"
+      " · host: `gemini-5.0-flash-low`) · 94% · 120 ms"
+  )
+
+  badge_active = router_hook._build_cli_badge_line(
+      synth_pro_route,
+      current_model="gemini-5.0-pro-high",
+      switched=False,
+      delegated_upgrade=False,
+  )
+  assert badge_active == (
+      "> ✦ **Routed with Intent** (Active: `gemini-5.0-pro-high` [High])"
+      " · 94% · 120 ms"
+  )
+
+  badge_recommended = router_hook._build_cli_badge_line(
+      synth_lite_route,
+      current_model="gemini-5.0-pro-high",
+      switched=False,
+      delegated_upgrade=False,
+  )
+  assert badge_recommended == (
+      "> ✦ **Routed with Intent** (Recommended: `gemini-5.0-flash-low` [Low]"
+      " · active: `gemini-5.0-pro-high`) · 97% · 4 ms"
+  )
+
+  # Pre-routed Turn 1 (`inject_cli_badge=True`) emits State 1 (`Switched ->`)
+  switched_prompt = "Design a multi-region consensus quorum protocol"
+  switched_hash = router_hook.hashlib.sha256(
+      switched_prompt.encode("utf-8")
+  ).hexdigest()[:16]
+  monkeypatch.setenv(
+      "GEMINI_DECISIONS_PRE_ROUTED",
+      json.dumps({
+          "prompt_hash": switched_hash,
+          "inject_cli_badge": True,
+          "route": synth_pro_route,
+      }),
+  )
+  out_switched = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "conv-switched-1",
+          "invocationNum": 1,
+          "modelName": "gemini-5.0-pro-high",
+          "lastUserInput": switched_prompt,
+      },
+      state_dir=state_dir,
+      config_path=cfg_path,
+      route_fn=lambda *_a, **_kw: (_ for _ in ()).throw(
+          AssertionError("pre-routed turn must not call route_fn")
+      ),
+  )
+  monkeypatch.delenv("GEMINI_DECISIONS_PRE_ROUTED", raising=False)
+  switched_sys = out_switched["injectSteps"][0]["systemMessage"][
+      "systemMessage"
+  ]
+  assert "(Switched -> `gemini-5.0-pro-high` [High])" in switched_sys
+  assert "ROUTING UPGRADE DIRECTIVE" not in switched_sys
+
+  # 2. File-less proof prompt on `flash_lite` host -> `Subagent -> ... · host:` + upgrade directive
+  proof_prompt = (
+      "Prove why a naive lock-free Treiber stack suffers from the ABA problem"
+      " under concurrent pop/push in 5 concise lines, and tell me at the end"
+      " what model you used"
+  )
+  out_upgrade = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "conv-host-lite",
+          "invocationNum": 1,
+          "modelName": "gemini-5.0-flash-low",
+          "lastUserInput": proof_prompt,
+      },
+      state_dir=state_dir,
+      config_path=cfg_path,
+      route_fn=lambda *_a, **_kw: dict(synth_pro_route),
+  )
+  upgrade_sys = out_upgrade["injectSteps"][0]["systemMessage"]["systemMessage"]
+  upgrade_ri = out_upgrade["injectSteps"][0]["systemMessage"]["renderInfo"]
+  assert (
+      "(Subagent -> `gemini-5.0-pro-high` [High] · host:"
+      " `gemini-5.0-flash-low`)"
+      in upgrade_sys
+  )
+  assert "ROUTING UPGRADE DIRECTIVE:" in upgrade_sys
+  assert (
+      "invoke_subagent(TypeName='routed-specialist', Role='Specialist',"
+      " Model='inherit'"
+      in upgrade_sys
+  )
+  assert "zero files" in upgrade_sys
+  assert "`gemini-5.0-pro-high`" in upgrade_sys
+  assert upgrade_ri["title"].startswith("Recommended: gemini-5.0-pro-high")
+
+  # Verify bundled `routed-specialist.md` omits `invoke_subagent` / `define_subagent` tools
+  specialist_md = (
+      REPO_ROOT / "agents" / "routed-specialist.md"
+  ).read_text(encoding="utf-8")
+  specialist_frontmatter = specialist_md.split("---", 2)[1]
+  assert "subagent: true" in specialist_frontmatter
+  assert "mainAgent: false" in specialist_frontmatter
+  assert "invoke_subagent" not in specialist_frontmatter
+  assert "define_subagent" not in specialist_frontmatter
+
+  # Host already on `pro` (`gemini-5.0-pro-high`) -> `Active:`, NO upgrade directive
+  out_already_pro = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "conv-host-pro",
+          "invocationNum": 1,
+          "modelName": "gemini-5.0-pro-high",
+          "lastUserInput": proof_prompt,
+      },
+      state_dir=state_dir,
+      config_path=cfg_path,
+      route_fn=lambda *_a, **_kw: dict(synth_pro_route),
+  )
+  already_pro_sys = out_already_pro["injectSteps"][0]["systemMessage"][
+      "systemMessage"
+  ]
+  assert "(Active: `gemini-5.0-pro-high` [High])" in already_pro_sys
+  assert "ROUTING UPGRADE DIRECTIVE" not in already_pro_sys
+
+  # Host on `pro` (`gemini-5.0-pro-high`) with `flash_lite` prompt -> `Recommended: ... · active:`, NO upgrade directive
+  out_advisor_down = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "conv-host-pro-lite-prompt",
+          "invocationNum": 1,
+          "modelName": "gemini-5.0-pro-high",
+          "lastUserInput": "What is 2+2?",
+      },
+      state_dir=state_dir,
+      config_path=cfg_path,
+      route_fn=lambda *_a, **_kw: dict(synth_lite_route),
+  )
+  advisor_down_sys = out_advisor_down["injectSteps"][0]["systemMessage"][
+      "systemMessage"
+  ]
+  assert (
+      "(Recommended: `gemini-5.0-flash-low` [Low] · active:"
+      " `gemini-5.0-pro-high`)"
+      in advisor_down_sys
+  )
+  assert "ROUTING UPGRADE DIRECTIVE" not in advisor_down_sys
+
+  # 3. `handle_pre_tool_use` writes `subagent_child` guard and child `handle_pre_invocation`
+  #    short-circuits with `{}` (0 `route_fn` calls, 0 inner badges, 0 recursive directives)
+  out_pre_tool = router_hook.handle_pre_tool_use(
+      {
+          "conversationId": "conv-host-lite",
+          "lastUserInput": proof_prompt,
+          "toolCall": {
+              "name": "invoke_subagent",
+              "args": {
+                  "TypeName": "self",
+                  "Role": "Specialist",
+                  "Model": "inherit",
+                  "Prompt": proof_prompt,
+              },
+          },
+      },
+      state_dir=state_dir,
+      config_path=cfg_path,
+      route_fn=lambda *_a, **_kw: dict(synth_pro_route),
+  )
+  assert out_pre_tool["decision"] == "allow"
+  assert out_pre_tool["overwrite"] == {"Model": "pro"}
+
+  sub_hash = router_hook.hashlib.sha256(
+      proof_prompt.encode("utf-8")
+  ).hexdigest()[:16]
+  guard_file = router_hook.safe_state_path(state_dir, sub_hash, "subagent_child")
+  assert guard_file.is_file()
+  guard_data = json.loads(guard_file.read_text(encoding="utf-8"))
+  assert guard_data["prompt_hash"] == sub_hash
+  assert guard_data["assigned_tier"] == "pro"
+
+  child_route_calls = 0
+
+  def forbidden_child_route(*_a: Any, **_kw: Any) -> dict[str, Any]:
+    nonlocal child_route_calls
+    child_route_calls += 1
+    raise AssertionError("Child subagent must not call route_fn!")
+
+  child_out = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "conv-spawned-child-1",
+          "invocationNum": 1,
+          "modelName": "gemini-5.0-pro-high",
+          "lastUserInput": proof_prompt,
+      },
+      state_dir=state_dir,
+      config_path=cfg_path,
+      route_fn=forbidden_child_route,
+  )
+  assert child_out == {}
+  assert child_route_calls == 0
+  assert not guard_file.exists()
+
+  # Role-wrapped child prompt fallback also short-circuits with 0 calls to `route_fn`
+  router_hook.handle_pre_tool_use(
+      {
+          "conversationId": "conv-host-lite",
+          "lastUserInput": proof_prompt,
+          "toolCall": {
+              "name": "invoke_subagent",
+              "args": {
+                  "TypeName": "self",
+                  "Role": "Concurrency Theorist",
+                  "Model": "inherit",
+                  "Prompt": proof_prompt,
+              },
+          },
+      },
+      state_dir=state_dir,
+      config_path=cfg_path,
+      route_fn=lambda *_a, **_kw: dict(synth_pro_route),
+  )
+  wrapped_child_out = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "conv-spawned-child-2",
+          "invocationNum": 1,
+          "modelName": "gemini-5.0-pro-high",
+          "lastUserInput": f"[Role: Concurrency Theorist]\n\n{proof_prompt}",
+      },
+      state_dir=state_dir,
+      config_path=cfg_path,
+      route_fn=forbidden_child_route,
+  )
+  assert wrapped_child_out == {}
+  assert child_route_calls == 0
+

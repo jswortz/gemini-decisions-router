@@ -36,6 +36,7 @@ cp "${SCRIPT_DIR}/mcp_server.py" "${TARGET_DIR}/mcp_server.py"
 cp "${SCRIPT_DIR}/router_hook.py" "${TARGET_DIR}/router_hook.py"
 cp "${SCRIPT_DIR}/assets/logo.svg" "${TARGET_DIR}/assets/logo.svg"
 cp "${SCRIPT_DIR}/agents/intent-router.md" "${TARGET_DIR}/agents/intent-router.md"
+cp "${SCRIPT_DIR}/agents/routed-specialist.md" "${TARGET_DIR}/agents/routed-specialist.md"
 cp "${SCRIPT_DIR}/rules/AGENTS.md" "${TARGET_DIR}/rules/AGENTS.md"
 cp "${SCRIPT_DIR}/skills/gemini-decisions-router/SKILL.md" \
    "${TARGET_DIR}/skills/gemini-decisions-router/SKILL.md"
