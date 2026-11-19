@@ -51,6 +51,8 @@ def test_zero_internal_google_references() -> None:
       "/usr/local/" + "google",
       "wortz-" + "project",
       "down" + "shifter",
+      "fa" + "ble",
+      "ba" + "ki",
       "ken" + "limmj",
       "AIza" + "Sy",
       "ya" + "29.",
@@ -2018,6 +2020,18 @@ def test_head_to_head_flash_lite_benchmark_and_streaming_stdout(
   assert (
       strats["flash_lite_json_router"]["calibration"]["populated_bins_4"] == 1
   )
+
+  # 4. Verify head-to-head 1600x1000 PNG chart asset and renderer script exist
+  h2h_chart_script = REPO_ROOT / "benchmarks" / "render_head_to_head_chart.py"
+  h2h_chart_png = REPO_ROOT / "assets" / "router-head-to-head.png"
+  assert h2h_chart_script.is_file()
+  assert h2h_chart_png.is_file()
+  h2h_png_bytes = h2h_chart_png.read_bytes()
+  assert len(h2h_png_bytes) > 50_000
+  assert h2h_png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+  # PNG IHDR stores big-endian width (bytes 16..20) and height (bytes 20..24)
+  assert int.from_bytes(h2h_png_bytes[16:20], "big") == 1600
+  assert int.from_bytes(h2h_png_bytes[20:24], "big") == 1000
 
 
 def test_smart_thread_floor_quick_lookup_unlock_and_config(
