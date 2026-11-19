@@ -18,6 +18,22 @@ Traditional LLM routers generate JSON text token-by-token, adding 400 to 1,500 m
 - **4 MCP Tools (`create_decision`, `route_prompt`, `list_models`, `configure_router`):** Exposes calibrated decision gates, prompt classification, live target model discovery (`list_models(refresh=true)`), and live router configuration directly to your agents.
 - **Pure Python 3.11+ Standard Library:** Runs out of the box with zero mandatory `pip` packages. Automatically uses `google-auth` if present, and falls back to native stdlib OAuth2 refresh and GCE/Cloud Run/GKE Metadata Server queries.
 
+## Live Benchmarks (`N=100` Prompts + `N=15` End-to-End)
+
+![Benchmark Dashboard](assets/benchmark-dashboard.png)
+
+Evaluated live against `generativelanguage.googleapis.com/v1beta` across 100 stratified engineering and agentic prompts (6 categories) and 15 multi-tier downstream completions (`maxOutputTokens: 512`):
+
+| Strategy | Router `p50` / `p90` | Output Tokens | Exact Tier Accuracy | Critical Pro-Miss Rate | 100-Prompt E2E Time | 100-Prompt E2E Cost |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Gemini Decisions Router (Tier 0+1)** | **`278 ms` / `411 ms`** *(Tier 0: `<0.1 ms`)* | **`0`** | **`96.0%`** (`96/100`) | **`0.0%`** (`0/30`) | **`335.5 s` (`-29.1%`)** | **`$0.225` (`-56.3%`)** |
+| **Pure `gemini-decision-1` (Tier 1)** | **`235 ms` / `374 ms`** | **`0`** | **`96.0%`** (`96/100`) | **`0.0%`** (`0/30`) | `331.3 s` (`-30.0%`) | `$0.226` (`-56.2%`) |
+| **`GenerateContent` JSON (`gemini-2.5-flash`)** | `1,124 ms` / `1,644 ms` (`4.0x-4.8x` slower) | `144.3` | `100.0%` (`15/15`) | `0.0%` (`0/5`) | `416.0 s` (`-12.1%`) | `$0.258` (`-50.0%`) |
+| **Offline Lexical Baseline** | `0.01 ms` / `0.01 ms` | `0` | `79.0%` (`79/100`) | `36.7%` (`11/30` missed) | N/A | N/A |
+| **Always-Pro Baseline** | `0 ms` | `0` | `30.0%` (`70%` over-routed) | `0.0%` (`0/30`) | `473.2 s` *(Baseline)* | `$0.515` *(Baseline)* |
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full methodology, confusion matrices, confidence calibration (`ECE = 0.103`), and reproducibility commands (`python3 benchmarks/run_benchmark.py --mock` runs offline in `<0.1s`).
+
 ## Authentication Modes
 
 | Mode | Endpoint | Credentials Used | Best For |
@@ -297,7 +313,9 @@ agy plugin validate . --strict
 - `docs/CUSTOMER_ONBOARDING.md`: Enterprise Google Cloud customer rollout guide
 - `docs/AUTHENTICATION_ADC.md`: Keyless ADC architecture and troubleshooting guide
 - `docs/API_KEY_QUICKSTART.md`: Frictionless install, `0600` `.env` setup, inline visibility, and CLI/MCP usage guide
+- `docs/BENCHMARKS.md`: Live 100-prompt routing accuracy, latency percentiles, calibration, and end-to-end cost/time report
 - `docs/TESTING_STRATEGY.md`: Target model catalog, security/deduplication/anti-hang test strategy, and live telemetry results
+- `benchmarks/`: `prompts_100.json` dataset, `run_benchmark.py` (live + `--mock` runner), `render_charts.py`, and `results_100.json`
 - `tests/test_external_plugin.py`: Unit, mock HTTP, `.env` permission/symlink, verbosity, deduplication, pre-flight, and hygiene test suite
 
 ## License

@@ -1,0 +1,1017 @@
+[
+  {
+    "id": "P001",
+    "category": "quick_lookup",
+    "prompt": "What tar flags extract a .tar.gz archive into a specific target directory on Linux?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P002",
+    "category": "quick_lookup",
+    "prompt": "What is the difference between HTTP 401 Unauthorized and HTTP 403 Forbidden?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P003",
+    "category": "quick_lookup",
+    "prompt": "Give me the jq filter to extract .items[].metadata.name as raw strings without quotes.",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P004",
+    "category": "quick_lookup",
+    "prompt": "What is the default TCP port number for PostgreSQL and for Redis?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P005",
+    "category": "quick_lookup",
+    "prompt": "What is the Python 3.11 function signature and parameter order for functools.lru_cache?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P006",
+    "category": "quick_lookup",
+    "prompt": "Which git command lists only the file names changed in the most recent commit?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P007",
+    "category": "quick_lookup",
+    "prompt": "What kubectl flag streams logs from the previous terminated container instance of a pod?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P008",
+    "category": "quick_lookup",
+    "prompt": "Show the curl flags to follow redirects, stay silent, and print only the final HTTP status code.",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P009",
+    "category": "quick_lookup",
+    "prompt": "In standard SQL, what is the difference between COALESCE and NULLIF?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P010",
+    "category": "quick_lookup",
+    "prompt": "What regex character class matches a lowercase hex UUID v4 string?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P011",
+    "category": "quick_lookup",
+    "prompt": "What numeric exit code does Linux assign when a process is terminated by SIGKILL (signal 9)?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P012",
+    "category": "quick_lookup",
+    "prompt": "What 5-field cron expression runs a job at 04:30 UTC every Monday?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P013",
+    "category": "quick_lookup",
+    "prompt": "What does HTTP status code 429 mean and which response header tells the client when to retry?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P014",
+    "category": "quick_lookup",
+    "prompt": "In Python pathlib, which Path attribute returns the filename without its final suffix?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P015",
+    "category": "quick_lookup",
+    "prompt": "What openssl x509 command prints the expiration date of a local PEM certificate file?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P016",
+    "category": "quick_lookup",
+    "prompt": "What is the SQL keyword order between WHERE, GROUP BY, HAVING, and ORDER BY?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P017",
+    "category": "quick_lookup",
+    "prompt": "Which git reset flag moves HEAD back one commit while keeping all changes staged in the index?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P018",
+    "category": "quick_lookup",
+    "prompt": "What is the difference between a DNS CNAME record and a DNS TXT record?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P019",
+    "category": "quick_lookup",
+    "prompt": "In Python datetime, what strftime format code outputs an ISO 8601 UTC offset like +0000?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P020",
+    "category": "quick_lookup",
+    "prompt": "What docker run flag automatically removes the container filesystem as soon as it exits?",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P021",
+    "category": "coding_edit",
+    "prompt": "Write a FastAPI GET /orders endpoint dependency in Python using Pydantic v2 that validates cursor-based pagination query parameters (limit between 1 and 100 defaulting to 25, optional base64 cursor, and sort_dir in asc or desc) and returns structured 422 validation errors.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P022",
+    "category": "coding_edit",
+    "prompt": "Create reusable pytest fixtures in conftest.py that spin up an isolated in-memory SQLite database per test function, apply schema.sql on setup, yield a configured connection with row_factory=sqlite3.Row, and roll back cleanly on teardown.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P023",
+    "category": "coding_edit",
+    "prompt": "Refactor a TypeScript React checkout form component that currently uses six separate useState hooks (items, promoCode, isApplyingPromo, errorBanner, shippingMethod, and totalCents) into a typed useReducer hook with discriminated union actions.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P024",
+    "category": "coding_edit",
+    "prompt": "Implement an http.RoundTripper middleware in Go that retries idempotent GET and HEAD requests up to 3 times on HTTP 502, 503, and 504 responses using exponential backoff with full jitter while respecting req.Context() cancellation.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P025",
+    "category": "coding_edit",
+    "prompt": "Write a lightweight Python SQLite schema migration helper function that reads numbered NNN_name.sql files from a directory, tracks applied versions and SHA-256 checksums in a schema_migrations table, and applies pending migrations inside transactions.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P026",
+    "category": "coding_edit",
+    "prompt": "Implement a memory-efficient Python generator that streams a multi-gigabyte UTF-8 CSV file row by row, normalizes header names to snake_case, strips surrounding whitespace, and yields validated dicts while logging malformed line numbers.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P027",
+    "category": "coding_edit",
+    "prompt": "Refactor a bloated single-stage Python Dockerfile that installs build-essential and gcc in the runtime image into a clean two-stage build using python:3.12-slim, pre-built wheels in a builder stage, and a non-root appuser.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P028",
+    "category": "coding_edit",
+    "prompt": "Write an Express.js TypeScript middleware that validates an incoming X-Hub-Signature-256 HMAC-SHA256 webhook header against the raw request body using crypto.timingSafeEqual before passing control to the route handler.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P029",
+    "category": "coding_edit",
+    "prompt": "Add a Rust CLI argument definition using clap v4 derive macros for a backup tool with subcommands create, verify, and restore, supporting --compression (gzip, zstd, none), --threads, and --dry-run flags with unit tests.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P030",
+    "category": "coding_edit",
+    "prompt": "Write an async Python helper using asyncio.Semaphore and httpx.AsyncClient that fetches a list of URLs with a configurable concurrency cap of 10, per-request timeout of 5 seconds, and returns results keyed by URL without cancelling sibling tasks on HTTP errors.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P031",
+    "category": "coding_edit",
+    "prompt": "Implement a Django ORM query refactor for an InvoiceListView serializer that eliminates N+1 queries across customer, billing_address, and line_items using select_related and Prefetch with a filtered queryset, plus a django.test assertNumQueries test.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P032",
+    "category": "coding_edit",
+    "prompt": "Write a Node.js Transform stream class in TypeScript that accepts arbitrary Buffer chunks from an HTTP response, splits on newline boundaries, parses each non-empty line as NDJSON, and emits typed objects downstream.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P033",
+    "category": "coding_edit",
+    "prompt": "Create a GitHub Actions workflow YAML that runs ruff, mypy, and pytest across Python 3.11 and 3.12 on Ubuntu, caches the uv virtual environment keyed on uv.lock, and uploads JUnit XML test reports as artifacts.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P034",
+    "category": "coding_edit",
+    "prompt": "Write a small Redis Lua script and accompanying Python wrapper that implements a sliding-window per-API-key rate limiter returning both whether the request is allowed and the remaining quota in the current window.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P035",
+    "category": "coding_edit",
+    "prompt": "Implement a Pydantic v2 Settings class using pydantic-settings that loads database pool sizes, CORS origins from a comma-separated env var, and structured log levels while rejecting negative timeout values.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P036",
+    "category": "coding_edit",
+    "prompt": "Write a Vue 3 Composition API composable useDebouncedSearch(queryRef, delayMs) in TypeScript that cancels stale fetch requests via AbortController whenever the search term updates before completion.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P037",
+    "category": "coding_edit",
+    "prompt": "Create a reusable Terraform module for an AWS S3 artifact bucket with server-side KMS encryption, public access block enabled, versioning enabled, and lifecycle rules transitioning objects to Glacier Instant Retrieval after 30 days.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P038",
+    "category": "coding_edit",
+    "prompt": "Write a Go HTTP `/healthz` and `/readyz` handler package that checks PostgreSQL ping latency within a 500ms context deadline and returns JSON component statuses with HTTP 200 or 503.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P039",
+    "category": "coding_edit",
+    "prompt": "Implement a Python CLI script using argparse and pathlib that scans a markdown documentation directory, checks all relative file links and heading anchors, and exits non-zero with a formatted report if broken links are found.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P040",
+    "category": "coding_edit",
+    "prompt": "Clean up a project Makefile to add .PHONY declarations, self-documenting help output parsed from ## target comments, strict bash .SHELLFLAGS (-euo pipefail), and targets for lint, test, build, and clean.",
+    "expected_tier": "flash",
+    "expected_task_class": "coding_edit",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P041",
+    "category": "writing_docs",
+    "prompt": "Draft clear developer reference documentation in Markdown for our REST endpoint POST /v2/webhooks/subscriptions, covering authentication headers, request fields (target_url, event_types, secret_rotation_hours), response examples, and error status codes.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P042",
+    "category": "writing_docs",
+    "prompt": "Write a blameless incident postmortem summary in Markdown from these notes: 14:02 UTC bad config push set Redis maxclients to 100; 14:06 checkout API error rate hit 18%; 14:14 alert paged on-call; 14:19 config rolled back; 14:22 traffic recovered. Include impact, timeline, contributing factors, and action items.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P043",
+    "category": "writing_docs",
+    "prompt": "Draft a day-one backend engineer onboarding runbook covering prerequisites (Docker Desktop, Python 3.12, Node 20), local environment setup, seeding local test data, running unit tests, and verifying local health endpoints.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P044",
+    "category": "writing_docs",
+    "prompt": "Create a concise Architecture Decision Record (ADR) document template in Markdown with sections for Status, Context, Decision Drivers, Considered Options, Decision Outcome, Positive and Negative Consequences, and Compliance Verification.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P045",
+    "category": "writing_docs",
+    "prompt": "Write a polished Keep-a-Changelog v2.4.0 release entry grouping these updates under Added, Changed, Fixed, and Deprecated: batch export endpoint, OAuth token refresh jitter, CSV UTF-8 BOM fix, and v1/reports sunset notice.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P046",
+    "category": "writing_docs",
+    "prompt": "Draft a comprehensive Pull Request description summarizing a change that replaces polling in the notification bell UI with Server-Sent Events, outlining motivation, user-facing changes, rollout flag, rollback plan, and manual QA steps.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P047",
+    "category": "writing_docs",
+    "prompt": "Write a customer-facing API migration guide explaining how to upgrade from offset-based pagination (?page=2&per_page=50) in v1 to cursor-based pagination (?cursor=...&limit=50) in v2 before the v1 sunset date.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P048",
+    "category": "writing_docs",
+    "prompt": "Draft an on-call operational playbook section explaining how to triage a High Queue Backlog alert on our email delivery worker, including safe metrics to check first, customer communication thresholds, and safe horizontal scaling steps.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P049",
+    "category": "writing_docs",
+    "prompt": "Write a concise customer email announcing a scheduled 15-minute read-only maintenance window for billing portal upgrades next Saturday at 02:00 UTC, clarifying that live API traffic and webhook deliveries are unaffected.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P050",
+    "category": "writing_docs",
+    "prompt": "Draft a README Troubleshooting section covering the five most common local development issues: port 5432 already in use, expired local TLS certs, missing .env file, stale Docker volume state, and clock skew in JWT validation.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P051",
+    "category": "writing_docs",
+    "prompt": "Write a data dictionary Markdown page documenting the columns, grain, update cadence, nullability, and PII classification of our analytics.subscription_events warehouse table for business analysts.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P052",
+    "category": "writing_docs",
+    "prompt": "Draft a public SECURITY.md vulnerability reporting policy for an open-source SDK repository detailing supported versions, private disclosure contact instructions, response SLA targets, and safe-harbor scope.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P053",
+    "category": "writing_docs",
+    "prompt": "Write an executive weekly engineering status memo summarizing Q3 search relevance milestones completed, current latency KPI progress (p95 down from 290ms to 180ms), one staffing dependency, and next week's priorities.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P054",
+    "category": "writing_docs",
+    "prompt": "Draft user-facing documentation explaining how webhook delivery retries, exponential backoff intervals, dead-letter notifications, and manual replay work in our developer dashboard.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P055",
+    "category": "writing_docs",
+    "prompt": "Create a CONTRIBUTING.md guide for an open-source CLI repository covering issue reporting etiquette, branch naming conventions, commit message style, required test coverage, and code review expectations.",
+    "expected_tier": "flash",
+    "expected_task_class": "writing_docs",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P056",
+    "category": "data_analysis",
+    "prompt": "Write a BigQuery Standard SQL query over `analytics.user_events` (user_id, event_ts, event_name) that computes Day-1, Day-7, and Day-30 retention percentages grouped by each user's signup cohort date over the past 60 days.",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P057",
+    "category": "data_analysis",
+    "prompt": "Write a PostgreSQL query against `api_request_logs` (ts, route, status_code, duration_ms) to calculate request volume, error rate, p50, p95, and p99 latency grouped by route for the last 24 hours, ordered by p95 descending.",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P058",
+    "category": "data_analysis",
+    "prompt": "Write a Python script using collections.Counter and statistics that reads an access.jsonl log file and prints the top 10 error codes, hourly HTTP 5xx counts, and median response bytes per upstream host.",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P059",
+    "category": "data_analysis",
+    "prompt": "Write a SQL funnel conversion query over `checkout_events` (session_id, step_name, occurred_at) measuring unique sessions reaching view_cart, begin_checkout, add_payment_info, and purchase_complete, plus step-over-step drop-off rates.",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P060",
+    "category": "data_analysis",
+    "prompt": "Write a BigQuery SQL query over exported cloud billing records (`service.description`, `sku.description`, `usage_start_time`, `cost`, `credits`) to compute net daily spend by service and flag SKUs with >25% week-over-week cost growth.",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P061",
+    "category": "data_analysis",
+    "prompt": "Write a DuckDB SQL query that reads partitioned `s3://logs/events/*.parquet` files, groups user sessions using a 30-minute inactivity gap via LAG(), and computes average session duration and events per session by device_type.",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P062",
+    "category": "data_analysis",
+    "prompt": "Using pandas, write an analysis snippet over `subscriptions_df` (account_id, month, mrr_usd, plan_tier) that decomposes month-over-month net MRR movement into New, Expansion, Contraction, Churn, and Reactivation buckets.",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P063",
+    "category": "data_analysis",
+    "prompt": "Write a ClickHouse SQL query over `gateway_metrics` that rolls up per-minute request counts, cache hit ratio, and `quantileTDigest(0.99)(upstream_ms)` grouped by region and cache_status for the past 7 days.",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P064",
+    "category": "data_analysis",
+    "prompt": "Write a Standard SQL query using window functions to compute Daily Active Users (DAU), 28-day Rolling Active Users (MAU), and the daily DAU/MAU stickiness ratio by platform (ios, android, web).",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P065",
+    "category": "data_analysis",
+    "prompt": "Write a SQL query over `support_tickets` (ticket_id, priority, created_at, first_reply_at, resolved_at) that calculates SLA breach percentages by priority tier excluding weekend non-business hours.",
+    "expected_tier": "flash",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P066",
+    "category": "data_analysis",
+    "prompt": "Our global checkout A/B experiment shows +2.8% conversion lift in every individual country segment, yet the pooled aggregate query reports a statistically significant -1.4% regression due to dynamic traffic-allocation ramping across enterprise and self-serve cohorts. Design the exact causal diagnosis, Simpson's paradox decomposition, inverse-probability-weighted (IPW) estimator, and cluster-robust bootstrap variance SQL + Python pipeline to recover the unbiased treatment effect.",
+    "expected_tier": "pro",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P067",
+    "category": "data_analysis",
+    "prompt": "We have three separate telemetry tables (envoy_access_logs, jvm_gc_safepoint_events, and pgbouncer_pool_stats) during intermittent p99.9 tail-latency spikes from 45ms to 4.2s while CPU stays below 35%. Formulate a multi-system queueing-theory root-cause analysis (Kingman's VUT approximation and Little's Law) with time-aligned SQL joins and cross-correlation lag tests to isolate whether GC stop-the-world pauses trigger connection-pool queueing collapse or vice versa.",
+    "expected_tier": "pro",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P068",
+    "category": "data_analysis",
+    "prompt": "Design a statistical evaluation framework for a two-sided logistics marketplace pricing experiment where buyer-seller network interference violates SUTVA across metro regions, per-order revenue has extreme Pareto tail skew, and product leadership wants continuous daily peeking. Derive a switchback + geo-cluster randomization variance model, CUPED pre-experiment covariate adjustment, and group-sequential alpha-spending boundaries.",
+    "expected_tier": "pro",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P069",
+    "category": "data_analysis",
+    "prompt": "Our financial reconciliation audit shows a 3.4% systematic discrepancy between Stripe settlement webhooks, Kafka payment-topic offsets, and hourly watermarked BigQuery ledger tables that worsens around UTC midnight and regional broker failovers. Design a forensic data-lineage investigation and SQL reconciliation model that separates late-arriving event watermark drops, non-deterministic deduplication window boundaries, and currency-rounding drift.",
+    "expected_tier": "pro",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P070",
+    "category": "data_analysis",
+    "prompt": "Analyze right-censored NVMe drive failure telemetry across 40,000 storage nodes where newer firmware batches appear to have higher raw failure rates only because they were deployed predominantly to write-intensive WAL clusters. Design a survival analysis pipeline using time-varying Cox proportional hazards and competing-risks cumulative incidence functions to separate firmware defects from write-amplification and thermal confounders.",
+    "expected_tier": "pro",
+    "expected_task_class": "data_analysis",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P071",
+    "category": "deep_debug_architecture",
+    "prompt": "Architect a multi-region active-active Cloud Spanner ledger schema and failover topology with <10s RTO, zero double-spend under regional isolation, interleaved parent-child tables avoiding monotonically increasing timestamp hotspots, and a backward-compatible expand-and-contract online schema migration protocol across rolling service versions.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P072",
+    "category": "deep_debug_architecture",
+    "prompt": "Our custom Raft metadata store occasionally serves stale linearizable reads for ~400ms during asymmetric network partitions where a deposed leader can still reach 1 follower and client gateways but cannot reach the new quorum. Diagnose the exact LeaseRead vs ReadIndex safety flaw under clock drift, explain how PreVote interacts with partition healing, and design the protocol fix.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P073",
+    "category": "deep_debug_architecture",
+    "prompt": "Debug a rare corruption race condition in our C++20 bounded lock-free MPMC ring buffer that passes millions of iterations on x86_64 TSO but corrupts slot sequence numbers under load on ARM64 Graviton instances. Analyze the weak memory-ordering interaction between compare_exchange_weak relaxed/acquire loads and producer slot publication, plus ABA wrap-around hazards, and provide the corrected memory barriers.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P074",
+    "category": "deep_debug_architecture",
+    "prompt": "Design a zero-downtime envelope encryption key-rotation architecture for 2 billion tenant secret records across PostgreSQL and object storage using KMS KEK/DEK hierarchies, authenticated AES-256-GCM AAD tenant binding preventing cross-tenant ciphertext transplant attacks, dual-read/dual-write versioned key headers, and throttled background re-wrapping.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P075",
+    "category": "deep_debug_architecture",
+    "prompt": "Produce a comprehensive security threat model and reference architecture for OAuth 2.1 sender-constrained tokens (DPoP RFC 9449 vs mTLS RFC 8705) across browser SPAs, Edge TLS-terminating reverse proxies, and long-lived WebSocket upgrades, mitigating token replay, authorization-code injection, JWK thumbprint spoofing, and SSRF key-fetch attacks.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P076",
+    "category": "deep_debug_architecture",
+    "prompt": "Design a fault-tolerant distributed order-reservation and payment saga orchestrator across Inventory, Risk, and Ledger microservices using the transactional outbox pattern, fencing tokens, and idempotent compensating actions that guarantee exact-once financial state convergence under message duplication, out-of-order broker delivery, and zombie worker pauses.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P077",
+    "category": "deep_debug_architecture",
+    "prompt": "Diagnose an intermittent segfault and cross-connection TLS payload mixup in a high-throughput Rust/C FFI proxy using Linux epoll edge-triggered mode (`EPOLLET | EPOLLONESHOT`) when file descriptors are rapidly closed and recycled by `accept4()` across worker threads while in-flight completion callbacks remain queued.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P078",
+    "category": "deep_debug_architecture",
+    "prompt": "Audit a multi-tenant PostgreSQL 16 SaaS architecture using Row-Level Security (`current_setting('app.tenant_id')`) behind transaction-mode PgBouncer pooling. Identify every tenant-isolation bypass vector (prepared statement caching, SECURITY DEFINER functions, `SET` vs `SET LOCAL` on aborted transactions, and unique-constraint error timing side channels) and design defense-in-depth mitigations.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P079",
+    "category": "deep_debug_architecture",
+    "prompt": "Design a zero-drop root CA and intermediate mTLS trust-bundle rotation protocol across three federated Kubernetes clusters running Istio service mesh and long-lived bidirectional gRPC streaming workloads, handling SPIFFE ID validation, dual-trust-anchor overlap phases, SDS secret push races, and emergency compromise revocation.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P080",
+    "category": "deep_debug_architecture",
+    "prompt": "Architect a globally distributed API gateway rate-limiting subsystem handling 1.2M RPS across 12 POPs that combines sub-millisecond local in-memory token buckets with asynchronous hierarchical quota synchronization to Redis Cluster, bounding worst-case global quota overshoot during Redis shard failovers or cross-region split-brain.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P081",
+    "category": "deep_debug_architecture",
+    "prompt": "Analyze a subtle Go goroutine leak and channel deadlock in a bounded fan-out/fan-in streaming pipeline where an early downstream error cancels `errgroup.WithContext`, causing upstream worker goroutines blocked on unbuffered result sends and nested retry timers to hang indefinitely during graceful server shutdown.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P082",
+    "category": "deep_debug_architecture",
+    "prompt": "Design an event-sourced financial audit log and snapshot compaction architecture supporting deterministic point-in-time replay, cryptographic Merkle-tree tamper evidence, GDPR crypto-shredding per subject without invalidating hash chains, and lazy schema upcasting across five years of historical event versions.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P083",
+    "category": "deep_debug_architecture",
+    "prompt": "Architect a multi-region relational + Valkey/Redis look-aside cache consistency protocol that eliminates the classic read-modify-write stale-cache anomaly (where a slow concurrent reader populates Redis with pre-commit database state after a writer's DELETE invalidation) using Leases/Cas tokens and CDC log invalidation.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P084",
+    "category": "deep_debug_architecture",
+    "prompt": "Perform a soundness and concurrency audit on a custom Rust `Future` combinator using `unsafe` `Pin::new_unchecked` over an intrusive doubly-linked timer wheel shared across a multi-threaded work-stealing executor. Explain how `mem::forget` drop-guarantee violations and lost `Waker` updates occur during concurrent timer cancellation and rescheduling.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P085",
+    "category": "deep_debug_architecture",
+    "prompt": "Design a hardened outbound webhook delivery subsystem for untrusted customer URLs that defeats SSRF against cloud metadata endpoints (`169.254.169.254`, IPv6-mapped IPv4, octal/decimal IP encodings), TOCTOU DNS rebinding between resolution and TCP connect, HTTP redirect smuggling, decompression bombs, and slowloris socket starvation.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P086",
+    "category": "deep_debug_architecture",
+    "prompt": "Design an online concurrent mark-and-sweep garbage collector for a petabyte-scale distributed Content-Addressable Storage (CAS) build cache where hundreds of stateless build workers upload action graphs and reference existing SHA-256 blobs concurrently without global stop-the-world locks or premature deletion of newly referenced blobs.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P087",
+    "category": "deep_debug_architecture",
+    "prompt": "Architect a Linux defense-in-depth execution sandbox for running untrusted AI-generated Python and Bash tool invocations on multi-tenant hosts using unprivileged user/PID/mount/network namespaces, pivot_root over read-only overlayfs, seccomp-bpf syscall allowlists, cgroup v2 memory/PIDs/CPU quotas, and credential-free egress proxy enforcement.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": true
+  },
+  {
+    "id": "P088",
+    "category": "deep_debug_architecture",
+    "prompt": "Diagnose 1.8-second stop-the-world stalls and RSS container OOM kills (despite JVM `-Xmx` staying 40% free) in a high-concurrency Netty + gRPC gateway running on JDK 21 G1GC. Analyze humongous region fragmentation, `PooledByteBufAllocator` arena pinning across virtual threads, and glibc malloc arena retention, then provide a complete remediation plan.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P089",
+    "category": "deep_debug_architecture",
+    "prompt": "In our sharded MVCC key-value store using Hybrid Logical Clocks (HLC) and two-phase commit across range shards, clients occasionally observe write-skew anomalies and non-monotonic read timestamps when NTP steps backward on one storage node. Analyze the causal read-uncertainty window violation and design deterministic commit-wait / read-restart bounds.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P090",
+    "category": "deep_debug_architecture",
+    "prompt": "Architect a WebRTC Selective Forwarding Unit (SFU) congestion-control and simulcast layer-switching state machine for 200-participant video rooms that prevents synchronized PLI keyframe storms, handles bursty Wi-Fi packet loss via adaptive FEC vs NACK trade-offs, and maintains smooth audio priority under uplink saturation.",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P091",
+    "category": "agentic_lifecycle",
+    "prompt": "ship it",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P092",
+    "category": "agentic_lifecycle",
+    "prompt": "lgtm",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P093",
+    "category": "agentic_lifecycle",
+    "prompt": "yes please",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P094",
+    "category": "agentic_lifecycle",
+    "prompt": "yes go ahead",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 2,
+    "thread_state": {
+      "locked_tier": "pro",
+      "locked_model_id": "gemini-3.1-pro-high",
+      "locked_thinking_level": 4,
+      "locked_task_class": "deep_debug_architecture"
+    },
+    "sample_e2e": false
+  },
+  {
+    "id": "P095",
+    "category": "agentic_lifecycle",
+    "prompt": "do step 2 next",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 2,
+    "thread_state": {
+      "locked_tier": "pro",
+      "locked_model_id": "gemini-3.1-pro-high",
+      "locked_thinking_level": 4,
+      "locked_task_class": "deep_debug_architecture"
+    },
+    "sample_e2e": false
+  },
+  {
+    "id": "P096",
+    "category": "agentic_lifecycle",
+    "prompt": "sounds good, proceed",
+    "expected_tier": "pro",
+    "expected_task_class": "deep_debug_architecture",
+    "user_turn_count": 2,
+    "thread_state": {
+      "locked_tier": "pro",
+      "locked_model_id": "gemini-3.1-pro-high",
+      "locked_thinking_level": 4,
+      "locked_task_class": "deep_debug_architecture"
+    },
+    "sample_e2e": false
+  },
+  {
+    "id": "P097",
+    "category": "agentic_lifecycle",
+    "prompt": "Subagent Role: Codebase Researcher\nTask: List the markdown files in docs/",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P098",
+    "category": "agentic_lifecycle",
+    "prompt": "Subagent Role: Log Reader\nTask: Check the last 5 lines of package.json",
+    "expected_tier": "flash_lite",
+    "expected_task_class": "quick_lookup",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P099",
+    "category": "agentic_lifecycle",
+    "prompt": "use gemini pro to review this IAM policy",
+    "expected_tier": "pro",
+    "expected_task_class": "explicit_override",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  },
+  {
+    "id": "P100",
+    "category": "agentic_lifecycle",
+    "prompt": "use claude opus on this concurrency trace",
+    "expected_tier": "pro",
+    "expected_task_class": "explicit_override",
+    "user_turn_count": 1,
+    "thread_state": null,
+    "sample_e2e": false
+  }
+]

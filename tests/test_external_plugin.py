@@ -1749,9 +1749,107 @@ def test_dynamic_model_discovery_cli_and_ls_parsing(
     ls_server.server_close()
 
 
+def test_benchmark_suite_dataset_mock_runner_and_live_results(
+    tmp_path: pathlib.Path,
+) -> None:
+  """Verifies 100-prompt dataset, offline --mock CI runner, and live results."""
+  dataset_path = REPO_ROOT / "benchmarks" / "prompts_100.json"
+  results_path = REPO_ROOT / "benchmarks" / "results_100.json"
+  runner_path = REPO_ROOT / "benchmarks" / "run_benchmark.py"
+  dashboard_path = REPO_ROOT / "assets" / "benchmark-dashboard.png"
+  bench_doc_path = REPO_ROOT / "docs" / "BENCHMARKS.md"
+
+  assert dataset_path.is_file()
+  assert results_path.is_file()
+  assert runner_path.is_file()
+  assert dashboard_path.is_file()
+  assert bench_doc_path.is_file()
+
+  # 1. Validate prompts_100.json stratification and schema
+  dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+  assert isinstance(dataset, list) and len(dataset) == 100
+  assert [item["id"] for item in dataset] == [
+      f"P{idx:03d}" for idx in range(1, 101)
+  ]
+  cat_counts: dict[str, int] = {}
+  sample_tiers: dict[str, int] = {}
+  for item in dataset:
+    cat = item["category"]
+    cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    assert item["expected_tier"] in ("flash_lite", "flash", "pro")
+    if item.get("sample_e2e"):
+      t = item["expected_tier"]
+      sample_tiers[t] = sample_tiers.get(t, 0) + 1
+  assert cat_counts == {
+      "quick_lookup": 20,
+      "coding_edit": 20,
+      "writing_docs": 15,
+      "data_analysis": 15,
+      "deep_debug_architecture": 20,
+      "agentic_lifecycle": 10,
+  }
+  assert sample_tiers == {"flash_lite": 5, "flash": 5, "pro": 5}
+
+  # 2. Verify deterministic offline --mock benchmark mode (<5s, zero network)
+  mock_out = tmp_path / "mock_results.json"
+  proc = subprocess.run(
+      [
+          sys.executable,
+          "-B",
+          str(runner_path),
+          "--dataset",
+          str(dataset_path),
+          "--output",
+          str(mock_out),
+          "--mock",
+      ],
+      capture_output=True,
+      text=True,
+      timeout=10.0,
+      check=True,
+  )
+  assert "[benchmark:mock]" in proc.stdout
+  mock_res = json.loads(mock_out.read_text(encoding="utf-8"))
+  assert mock_res["metadata"]["mode"] == "mock"
+  assert mock_res["metadata"]["dataset_size"] == 100
+  assert (
+      mock_res["strategies"]["decisions_router_full"]["tokens"][
+          "total_output_tokens"
+      ]
+      == 0
+  )
+
+  # 3. Validate live results_100.json invariants, secret hygiene, and PNG header
+  raw_live = results_path.read_text(encoding="utf-8")
+  assert "AIza" not in raw_live
+  assert "ya29." not in raw_live
+  live_res = json.loads(raw_live)
+  assert live_res["metadata"]["mode"] == "live"
+  assert live_res["metadata"]["dataset_size"] == 100
+  assert live_res["metadata"]["sample_e2e_size"] == 15
+
+  full_strat = live_res["strategies"]["decisions_router_full"]
+  tier1_strat = live_res["strategies"]["decisions_tier1_only"]
+  assert full_strat["tokens"]["total_output_tokens"] == 0
+  assert tier1_strat["tokens"]["total_output_tokens"] == 0
+  assert full_strat["accuracy"]["exact_tier_accuracy_pct"] >= 90.0
+  assert full_strat["accuracy"]["pro_miss_rate_pct"] == 0.0
+  assert (
+      live_res["e2e"]["projected_100_prompts"]["decisions_router_routed"][
+          "time_saved_vs_always_pro_pct"
+      ]
+      > 15.0
+  )
+
+  png_bytes = dashboard_path.read_bytes()
+  assert len(png_bytes) > 50_000
+  assert png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_docs_contain_no_em_or_en_dashes() -> None:
   doc_paths = [
       REPO_ROOT / "README.md",
+      REPO_ROOT / "docs" / "BENCHMARKS.md",
       REPO_ROOT / "docs" / "CUSTOMER_ONBOARDING.md",
       REPO_ROOT / "docs" / "AUTHENTICATION_ADC.md",
       REPO_ROOT / "docs" / "API_KEY_QUICKSTART.md",
