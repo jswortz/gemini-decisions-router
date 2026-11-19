@@ -32,11 +32,38 @@ This plugin connects the Antigravity Desktop App and `agy` CLI to the Gemini Dec
   - In `auto_switch` mode, merges built-in, cached auto-discovered, and custom Antigravity model enums and runs a `GetCascadeTrajectory` ownership pre-flight check before terminating a turn; if the Language Server does not own the cascade (such as in `agy` CLI), it automatically falls back to `advisor` mode so turns never hang.
 - `PreToolUse` (`invoke_subagent`): When `Model` is unset or `"inherit"`, assigns `flash_lite`, `flash`, or `pro` and includes a `"✦ Routed with Intent"` tool `reason` notice (omitted when `verbosity` is `"silent"`).
 
-## `agy-router` CLI Reference
+## Top-Level `agy` CLI Auto-Switching (`agyr`, `chat`, `intent-router`)
 
-`./install.sh` installs `~/.local/bin/agy-router` (fallback: `python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py <subcommand>`):
+Because standalone `agy` CLI runs an ephemeral Language Server per invocation, use the plugin's top-level CLI entrypoints for automatic model and effort switching in the terminal:
+
+1. **`agyr` (alias for `agy-router launch` / `agy-router run`):**
+   - `agyr "Refactor auth.py"` (or `-i`): Scores the prompt via `route_prompt`, resolves the installed CLI `--model` and sibling `--effort` (`low`, `medium`, `high`, `max`), prints the `AUTO-SWITCHED` banner to `stderr`, sets `GEMINI_DECISIONS_PRE_ROUTED` (so `PreInvocation` skips duplicate scoring in `0 ms`), and `exec`s `agy --model <id> --effort <effort> -i "<prompt>"`.
+   - `agyr -p "What is 2+2?"`: Headless print mode (`-p`), omitting the `stderr` banner automatically when `--output-format json` is passed.
+   - `agyr` (no prompt, no `-p`, no `-c`): Starts the interactive `agy` TUI on `flash_lite` with `--agent intent-router --model <lite_id> --effort low` so lightweight questions stay instant in-turn and heavier work delegates via `invoke_subagent(TypeName="self", Model="inherit")` into `PreToolUse` (`flash` / `pro`).
+   - Explicit `--model` or bare `-c` / `--conversation` without a prompt passes straight through to `agy` untouched. Pass `--dry-run` to inspect the JSON execution plan without launching `agy`.
+2. **`agy-router chat [--conversation ID] [--agy-bin PATH]`:**
+   - Interactive multi-turn terminal REPL that scores each turn with `route_prompt` (evolving `thread_state` under `enable_thread_floor`) and switches `--model` and `--effort` across turns while preserving conversation continuity (`--continue` / `--conversation`). Supports `/new` or `/reset` to start a fresh conversation and `/exit` or `/quit` to leave.
+3. **`agy --agent intent-router`:**
+   - Custom Markdown main agent (`agents/intent-router.md`, `mainAgent: true`, `subagent: false`) that handles `quick_lookup` turns directly and delegates substantive `coding_edit`, `writing_docs`, `data_analysis`, and `deep_debug_architecture` tasks to `invoke_subagent(TypeName="self", Model="inherit")`.
+
+## `agy-router` & `agyr` CLI Reference
+
+`./install.sh` installs `~/.local/bin/agy-router` and `~/.local/bin/agyr` (fallback: `python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py <subcommand>`):
 
 ```bash
+# Top-level routed agy launcher (interactive -i, headless -p, bare TUI intent-router, or --dry-run)
+agyr "Refactor this FastAPI endpoint to validate pagination parameters"
+agyr -p "What is 2+2?"
+agyr                                     # Launches agy --agent intent-router on flash_lite
+agy-router run --dry-run -p "What is 2+2?"
+
+# Multi-turn REPL with automatic per-turn model & effort switching (/new, /exit)
+agy-router chat
+agy-router chat --conversation <conversation-id>
+
+# Native agy TUI with the Intent-Routed Main Agent
+agy --agent intent-router
+
 # Write a 0600 ~/.config/gemini-decisions-router/.env file for Desktop App + agy CLI
 agy-router auth-setup --from-env
 printf '%s\n' 'your-ai-studio-api-key' | agy-router auth-setup --api-key-stdin
