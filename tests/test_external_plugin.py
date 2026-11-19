@@ -640,7 +640,7 @@ def test_list_and_configure_target_models(
   assert loaded_env["tier_models"]["pro"] == "gemini-2.5-pro"
 
   # MCP list_models tool returns the full catalog
-  srv = mcp_server.McpServer()
+  srv = mcp_server.McpServer(config_path=cfg_path)
   resp = json.loads(
       srv.handle_line(
           json.dumps({
@@ -1414,6 +1414,339 @@ def test_configure_router_mcp_tool_and_cli_commands(
   )
   status_json = json.loads(status_proc.stdout)
   assert status_json["router_config"]["verbosity"] == "compact"
+
+
+def test_dynamic_model_discovery_cli_and_ls_parsing(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Verifies dynamic CLI/LS model auto-discovery, 0600 cache, CLI, and MCP."""
+  # 1. parse_agy_models_output with realistic ANSI spinner prefixes and log lines
+  raw_cli_output = (
+      "\x1b[36m\r⠋ Fetching available models...\x1b[0m"
+      "\rgemini-5.0-flash-low    Gemini 5.0 Flash (Low)\n"
+      "I1119 00:00:00.000000 12345 client.go:42] transient info log\n"
+      "gemini-5.0-flash-medium  Gemini 5.0 Flash (Medium)\n"
+      "\r⠙ Refreshing catalog...\rgemini-5.0-pro-high     Gemini 5.0 Pro (High)\n"
+      "gemini-pro-orchestrator\tGemini Pro Orchestrator\n"
+      "ERROR: ignored diagnostic line\n"
+  )
+  parsed_cli = decisions_engine.parse_agy_models_output(raw_cli_output)
+  assert [m["id"] for m in parsed_cli] == [
+      "gemini-5.0-flash-low",
+      "gemini-5.0-flash-medium",
+      "gemini-5.0-pro-high",
+      "gemini-pro-orchestrator",
+  ]
+  by_cli_id = {m["id"]: m for m in parsed_cli}
+  assert by_cli_id["gemini-5.0-flash-low"]["tier"] == "flash_lite"
+  assert by_cli_id["gemini-5.0-flash-low"]["default_thinking_level"] == 1
+  assert by_cli_id["gemini-5.0-flash-medium"]["tier"] == "flash"
+  assert by_cli_id["gemini-5.0-flash-medium"]["default_thinking_level"] == 2
+  assert by_cli_id["gemini-5.0-pro-high"]["tier"] == "pro"
+  assert by_cli_id["gemini-5.0-pro-high"]["default_thinking_level"] == 4
+  assert by_cli_id["gemini-pro-orchestrator"]["source"] == "discovered_cli"
+
+  # 2. infer_model_tier_and_thinking across -low/-medium/-high/lite/flash/pro/orchestrator
+  assert decisions_engine.infer_model_tier_and_thinking(
+      "gemini-5.0-flash-lite", "Gemini 5.0 Flash Lite"
+  ) == ("flash_lite", 1)
+  assert decisions_engine.infer_model_tier_and_thinking(
+      "gemini-5.0-flash-low", "Gemini 5.0 Flash (Low)"
+  ) == ("flash_lite", 1)
+  assert decisions_engine.infer_model_tier_and_thinking(
+      "gemini-5.0-flash-medium", "Gemini 5.0 Flash (Medium)"
+  ) == ("flash", 2)
+  assert decisions_engine.infer_model_tier_and_thinking(
+      "gemini-5.0-flash-high", "Gemini 5.0 Flash (High)"
+  ) == ("flash", 3)
+  assert decisions_engine.infer_model_tier_and_thinking(
+      "gemini-5.0-pro-low", "Gemini 5.0 Pro (Low)"
+  ) == ("pro", 1)
+  assert decisions_engine.infer_model_tier_and_thinking(
+      "gemini-5.0-pro-medium", "Gemini 5.0 Pro (Medium)"
+  ) == ("pro", 2)
+  assert decisions_engine.infer_model_tier_and_thinking(
+      "gemini-5.0-pro-high", "Gemini 5.0 Pro (High)"
+  ) == ("pro", 4)
+  assert decisions_engine.infer_model_tier_and_thinking(
+      "gemini-pro-orchestrator", "Gemini Pro Orchestrator"
+  ) == ("pro", 2)
+  assert decisions_engine.infer_model_tier_and_thinking(
+      "gemini-pro-orchestrator-high", "Gemini Pro Orchestrator (High)"
+  ) == ("pro", 4)
+
+  # 3. Mock Antigravity Language Server GetAvailableModels + CSRF discovery
+  class _MockLsDiscoveryHandler(http.server.BaseHTTPRequestHandler):
+    seen_csrf = ""
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+      del fmt, args
+
+    def do_GET(self) -> None:  # pylint: disable=invalid-name
+      body = b'<html><script>window.cfg = {"csrfToken": "mock-ls-csrf-500"};</script></html>'
+      self.send_response(200)
+      self.send_header("Content-Type", "text/html")
+      self.send_header("Content-Length", str(len(body)))
+      self.end_headers()
+      self.wfile.write(body)
+
+    def do_POST(self) -> None:  # pylint: disable=invalid-name
+      length = int(self.headers.get("Content-Length", "0"))
+      if length:
+        _ = self.rfile.read(length)
+      type(self).seen_csrf = self.headers.get("x-codeium-csrf-token", "")
+      if (
+          self.path
+          != "/exa.language_server_pb.LanguageServerService/GetAvailableModels"
+          or type(self).seen_csrf != "mock-ls-csrf-500"
+      ):
+        self.send_response(403)
+        self.end_headers()
+        return
+      payload = {
+          "response": {
+              "tabModelIds": ["tab-autocomplete-v1"],
+              "agentModelSorts": [{
+                  "groups": [{
+                      "modelIds": [
+                          "gemini-5.0-flash-low",
+                          "gemini-5.0-flash-medium",
+                          "gemini-5.0-pro-high",
+                          "gemini-pro-orchestrator",
+                      ]
+                  }]
+              }],
+              "models": {
+                  "gemini-5.0-flash-low": {
+                      "label": "Gemini 5.0 Flash (Low)",
+                      "model": "MODEL_GEMINI_5_0_FLASH_LOW",
+                  },
+                  "gemini-5.0-flash-medium": {
+                      "label": "Gemini 5.0 Flash (Medium)",
+                      "model": "MODEL_GEMINI_5_0_FLASH_MEDIUM",
+                  },
+                  "gemini-5.0-pro-high": {
+                      "label": "Gemini 5.0 Pro (High)",
+                      "model": "MODEL_GEMINI_5_0_PRO_HIGH",
+                  },
+                  "gemini-pro-orchestrator": {
+                      "label": "Gemini Pro Orchestrator",
+                      "model": "MODEL_GEMINI_PRO_ORCHESTRATOR",
+                  },
+                  "tab-autocomplete-v1": {
+                      "label": "Tab Autocomplete",
+                      "model": "MODEL_TAB_V1",
+                  },
+                  "hidden-experiment-model": {
+                      "label": "Hidden Experiment",
+                      "isInternal": True,
+                      "model": "MODEL_HIDDEN_EXP",
+                  },
+              },
+          }
+      }
+      raw = json.dumps(payload).encode("utf-8")
+      self.send_response(200)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", str(len(raw)))
+      self.end_headers()
+      self.wfile.write(raw)
+
+  ls_server = http.server.HTTPServer(("127.0.0.1", 0), _MockLsDiscoveryHandler)
+  ls_port = ls_server.server_port
+  ls_thread = threading.Thread(target=ls_server.serve_forever, daemon=True)
+  ls_thread.start()
+
+  try:
+    ls_addr = f"127.0.0.1:{ls_port}"
+    ls_models = decisions_engine.discover_models_from_ls(ls_addr=ls_addr)
+    assert [m["id"] for m in ls_models] == [
+        "gemini-5.0-flash-low",
+        "gemini-5.0-flash-medium",
+        "gemini-5.0-pro-high",
+        "gemini-pro-orchestrator",
+    ]
+    assert {m["id"]: m["enum"] for m in ls_models}["gemini-5.0-pro-high"] == (
+        "MODEL_GEMINI_5_0_PRO_HIGH"
+    )
+    assert decisions_engine.discover_models_from_ls(ls_addr="127.0.0.1:9") == []
+
+    # 4. discover_installed_models 0600 cache + suggest_tier_models + merged catalog
+    fake_home = tmp_path / "isolated_home"
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir(parents=True)
+    fake_agy = fake_bin / "agy"
+    fake_agy.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['models']:\n"
+        f"  sys.stdout.write({raw_cli_output!r})\n",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(0o755)
+
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("ANTIGRAVITY_LS_ADDRESS", ls_addr)
+    monkeypatch.setenv("ANTIGRAVITY_CSRF_TOKEN", "mock-ls-csrf-500")
+    monkeypatch.delenv("GEMINI_DECISIONS_MODEL_FLASH_LITE", raising=False)
+    monkeypatch.delenv("GEMINI_DECISIONS_MODEL_FLASH", raising=False)
+    monkeypatch.delenv("GEMINI_DECISIONS_MODEL_PRO", raising=False)
+
+    cache_file = (
+        fake_home
+        / ".cache"
+        / "gemini-decisions-router"
+        / "discovered_models.json"
+    )
+    discovered = decisions_engine.discover_installed_models(
+        agy_bin=str(fake_agy),
+        cache_path=cache_file,
+        force_refresh=True,
+    )
+    assert len(discovered) == 4
+    assert cache_file.is_file()
+    assert stat.S_IMODE(cache_file.stat().st_mode) == 0o600
+    by_merged_id = {m["id"]: m for m in discovered}
+    assert (
+        by_merged_id["gemini-5.0-pro-high"]["enum"]
+        == "MODEL_GEMINI_5_0_PRO_HIGH"
+    )
+    assert (
+        by_merged_id["gemini-5.0-pro-high"]["label"] == "Gemini 5.0 Pro (High)"
+    )
+
+    # Fresh cache hit avoids network/CLI calls when force_refresh=False
+    cached_again = decisions_engine.discover_installed_models(
+        agy_bin=str(tmp_path / "nonexistent-agy"),
+        cache_path=cache_file,
+        force_refresh=False,
+    )
+    assert [m["id"] for m in cached_again] == [m["id"] for m in discovered]
+
+    suggested = decisions_engine.suggest_tier_models(discovered)
+    assert suggested == {
+        "flash_lite": "gemini-5.0-flash-low",
+        "flash": "gemini-5.0-flash-medium",
+        "pro": "gemini-5.0-pro-high",
+    }
+
+    merged_catalog = decisions_engine.list_available_target_models(
+        discovered_cache_path=cache_file,
+    )
+    assert merged_catalog["discovered_count"] == 4
+    assert merged_catalog["suggested_tier_models"] == suggested
+    merged_ids = {m["id"] for m in merged_catalog["available_target_models"]}
+    assert {
+        "gemini-3.1-pro-high",
+        "gemini-5.0-flash-low",
+        "gemini-5.0-flash-medium",
+        "gemini-5.0-pro-high",
+        "gemini-pro-orchestrator",
+    }.issubset(merged_ids)
+
+    # Hermeticity check: explicit environ without cache/refresh ignores disk cache
+    hermetic_catalog = decisions_engine.list_available_target_models(environ={})
+    assert hermetic_catalog["discovered_count"] == 0
+
+    # router_hook.resolve_model_enums picks up discovered LS enums automatically
+    resolved_enums = router_hook.resolve_model_enums({})
+    assert (
+        resolved_enums["gemini-5.0-pro-high"] == "MODEL_GEMINI_5_0_PRO_HIGH"
+    )
+
+    # 5. CLI sync-models --apply-recommended and list-models --refresh + MCP list_models
+    cli_env = dict(os.environ)
+    cli_env["HOME"] = str(fake_home)
+    cli_env["PATH"] = f"{fake_bin}{os.pathsep}{cli_env.get('PATH', '')}"
+    cli_env["ANTIGRAVITY_LS_ADDRESS"] = ls_addr
+    cli_env["ANTIGRAVITY_CSRF_TOKEN"] = "mock-ls-csrf-500"
+    for k in (
+        "GEMINI_DECISIONS_MODEL_FLASH_LITE",
+        "GEMINI_DECISIONS_MODEL_FLASH",
+        "GEMINI_DECISIONS_MODEL_PRO",
+    ):
+      cli_env.pop(k, None)
+
+    sync_proc = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            str(REPO_ROOT / "router_hook.py"),
+            "sync-models",
+            "--apply-recommended",
+        ],
+        env=cli_env,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+        check=True,
+    )
+    sync_json = json.loads(sync_proc.stdout)
+    assert sync_json["applied_recommended"] is True
+    assert sync_json["discovered_count"] == 4
+    assert sync_json["active_tier_models"] == suggested
+    assert sync_json["suggested_tier_models"] == suggested
+
+    list_proc = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            str(REPO_ROOT / "router_hook.py"),
+            "list-models",
+            "--refresh",
+        ],
+        env=cli_env,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+        check=True,
+    )
+    list_json = json.loads(list_proc.stdout)
+    assert list_json["discovered_count"] == 4
+    assert list_json["active_tier_models"] == suggested
+
+    isolated_cfg = (
+        fake_home
+        / ".config"
+        / "gemini-decisions-router"
+        / "router_config.json"
+    )
+    mcp_srv = mcp_server.McpServer(config_path=isolated_cfg)
+    mcp_resp = json.loads(
+        mcp_srv.handle_line(
+            json.dumps({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_models",
+                    "arguments": {"refresh": False},
+                },
+            }).encode("utf-8")
+        ).decode("utf-8")
+    )
+    assert mcp_resp["result"]["isError"] is False
+    mcp_sc = mcp_resp["result"]["structuredContent"]
+    assert mcp_sc["discovered_count"] == 4
+    assert mcp_sc["active_tier_models"] == suggested
+
+    mcp_bad = json.loads(
+        mcp_srv.handle_line(
+            json.dumps({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_models",
+                    "arguments": {"refresh": "invalid"},
+                },
+            }).encode("utf-8")
+        ).decode("utf-8")
+    )
+    assert mcp_bad["result"]["isError"] is True
+  finally:
+    ls_server.shutdown()
+    ls_server.server_close()
 
 
 def test_docs_contain_no_em_or_en_dashes() -> None:

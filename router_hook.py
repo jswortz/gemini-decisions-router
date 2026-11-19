@@ -15,7 +15,8 @@ CLI commands:
   - `auth-check [--live]`
   - `route --prompt "..."`
   - `status`
-  - `list-models`
+  - `list-models [--refresh]`
+  - `sync-models [--apply-recommended]`
   - `set-models [--flash-lite ID] [--flash ID] [--pro ID]`
   - `set-mode <advisor|auto_switch|off>`
   - `set-verbosity <silent|compact|normal|verbose>`
@@ -97,6 +98,37 @@ def _default_dotenv_path() -> pathlib.Path:
   if callable(fn):
     return pathlib.Path(fn())
   return pathlib.Path.home() / ".config" / "gemini-decisions-router" / ".env"
+
+
+def _default_discovered_models_path() -> pathlib.Path:
+  fn = getattr(decisions_engine, "default_discovered_models_path", None)
+  if callable(fn):
+    return pathlib.Path(fn())
+  return (
+      pathlib.Path.home()
+      / ".cache"
+      / "gemini-decisions-router"
+      / "discovered_models.json"
+  )
+
+
+def _list_target_models_compat(
+    *,
+    tier_models: Mapping[str, str] | None = None,
+    custom_model_enums: Mapping[str, str] | None = None,
+    refresh_discovered: bool = False,
+) -> dict[str, Any]:
+  try:
+    return decisions_engine.list_available_target_models(
+        tier_models=tier_models,
+        custom_model_enums=custom_model_enums,
+        refresh_discovered=refresh_discovered,
+    )
+  except TypeError:
+    return decisions_engine.list_available_target_models(
+        tier_models=tier_models,
+        custom_model_enums=custom_model_enums,
+    )
 
 
 def _effective_environ() -> Mapping[str, str]:
@@ -186,8 +218,39 @@ def load_router_config(
   return cfg
 
 
+def _load_discovered_models_for_enums() -> list[dict[str, Any]]:
+  cache_file = _default_discovered_models_path()
+  discover_fn = getattr(decisions_engine, "discover_installed_models", None)
+  if callable(discover_fn):
+    items: Any = None
+    try:
+      items = discover_fn(cache_path=cache_file, run_cli_fallback=False)
+    except TypeError:
+      try:
+        items = discover_fn(run_cli_fallback=False)
+      except Exception:  # pylint: disable=broad-except
+        items = None
+    except Exception:  # pylint: disable=broad-except
+      items = None
+    if isinstance(items, list) and items:
+      return items
+  if cache_file.is_file():
+    try:
+      data = json.loads(cache_file.read_text(encoding="utf-8"))
+      if isinstance(data, dict) and isinstance(data.get("models"), list):
+        return [m for m in data["models"] if isinstance(m, dict)]
+    except (OSError, ValueError):
+      pass
+  return []
+
+
 def resolve_model_enums(cfg: dict[str, Any] | None = None) -> dict[str, str]:
   enums = dict(MODEL_ENUMS)
+  for entry in _load_discovered_models_for_enums():
+    mid = str(entry.get("id") or "").strip()
+    enum_val = str(entry.get("enum") or "").strip()
+    if mid and enum_val and _SAFE_ENUM_RE.fullmatch(enum_val):
+      enums[mid] = enum_val
   if isinstance(cfg, dict) and isinstance(cfg.get("custom_model_enums"), dict):
     for mid, enum_val in cfg["custom_model_enums"].items():
       if str(mid).strip() and _SAFE_ENUM_RE.fullmatch(str(enum_val).strip()):
@@ -1198,7 +1261,7 @@ def _cmd_status() -> int:
     backend_info = {"error": e.to_dict()}
 
   ls_addr, _ = _discover_ls_endpoint()
-  catalog = decisions_engine.list_available_target_models(
+  catalog = _list_target_models_compat(
       tier_models=rcfg.get("tier_models"),
       custom_model_enums=rcfg.get("custom_model_enums"),
   )
@@ -1209,6 +1272,10 @@ def _cmd_status() -> int:
       "available_target_models": [
           m["id"] for m in catalog["available_target_models"]
       ],
+      "discovered_models_count": int(catalog.get("discovered_count", 0)),
+      "suggested_tier_models": dict(
+          catalog.get("suggested_tier_models") or {}
+      ),
       "decisions_backend": backend_info,
       "language_server_detected": bool(ls_addr),
       "state_dir": str(default_state_dir()),
@@ -1217,13 +1284,69 @@ def _cmd_status() -> int:
   return 0
 
 
-def _cmd_list_models() -> int:
+def _cmd_list_models(ns: argparse.Namespace | None = None) -> int:
   rcfg = load_router_config()
-  catalog = decisions_engine.list_available_target_models(
+  refresh = (
+      bool(getattr(ns, "refresh", False))
+      or not _default_discovered_models_path().is_file()
+  )
+  catalog = _list_target_models_compat(
       tier_models=rcfg.get("tier_models"),
       custom_model_enums=rcfg.get("custom_model_enums"),
+      refresh_discovered=refresh,
   )
   sys.stdout.write(json.dumps(catalog, indent=2) + "\n")
+  return 0
+
+
+def _cmd_sync_models(ns: argparse.Namespace) -> int:
+  rcfg = load_router_config()
+  catalog = _list_target_models_compat(
+      tier_models=rcfg.get("tier_models"),
+      custom_model_enums=rcfg.get("custom_model_enums"),
+      refresh_discovered=True,
+  )
+  suggested = dict(catalog.get("suggested_tier_models") or {})
+  active_tier_models = dict(catalog.get("active_tier_models") or {})
+  applied = False
+  if bool(getattr(ns, "apply_recommended", False)) and suggested:
+    updated_cfg = save_router_config({"tier_models": suggested})
+    active_tier_models = decisions_engine.resolve_tier_models(
+        updated_cfg.get("tier_models")
+    )
+    applied = True
+
+  if isinstance(catalog.get("discovered_models"), list):
+    discovered_models = list(catalog["discovered_models"])
+  else:
+    discovered_models = []
+    discover_fn = getattr(decisions_engine, "discover_installed_models", None)
+    if callable(discover_fn):
+      try:
+        cached = discover_fn(force_refresh=False, run_cli_fallback=False)
+        if isinstance(cached, list):
+          discovered_models = cached
+      except Exception:  # pylint: disable=broad-except
+        discovered_models = []
+    if not discovered_models:
+      discovered_models = [
+          m
+          for m in catalog.get("available_target_models", [])
+          if str(m.get("source") or "").startswith("discovered")
+      ]
+
+  summary = {
+      "status": "applied" if applied else "synced",
+      "applied_recommended": applied,
+      "cache_path": str(_default_discovered_models_path()),
+      "discovered_count": int(
+          catalog.get("discovered_count", len(discovered_models))
+      ),
+      "active_tier_models": active_tier_models,
+      "suggested_tier_models": suggested,
+      "discovered_models": discovered_models,
+  }
+  sys.stdout.write(json.dumps(summary, indent=2) + "\n")
   return 0
 
 
@@ -1594,7 +1717,20 @@ def main() -> int:
   )
 
   sub.add_parser("status")
-  sub.add_parser("list-models")
+
+  p_list_models = sub.add_parser("list-models")
+  p_list_models.add_argument(
+      "--refresh",
+      action="store_true",
+      help="Force live re-discovery of models from Antigravity LS and agy CLI.",
+  )
+
+  p_sync = sub.add_parser("sync-models")
+  p_sync.add_argument(
+      "--apply-recommended",
+      action="store_true",
+      help="Save suggested_tier_models into router_config.json.",
+  )
 
   p_models = sub.add_parser("set-models")
   p_models.add_argument("--flash-lite", default=None)
@@ -1653,7 +1789,9 @@ def main() -> int:
   if ns.cmd == "status":
     return _cmd_status()
   if ns.cmd == "list-models":
-    return _cmd_list_models()
+    return _cmd_list_models(ns)
+  if ns.cmd == "sync-models":
+    return _cmd_sync_models(ns)
   if ns.cmd == "set-models":
     return _cmd_set_models(ns)
   if ns.cmd == "set-mode":

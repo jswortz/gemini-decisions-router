@@ -128,14 +128,23 @@ _ROUTE_PROMPT_TOOL: dict[str, Any] = {
 _LIST_MODELS_TOOL: dict[str, Any] = {
     "name": "list_models",
     "description": (
-        "List all available target models supported by the router, their"
-        " Antigravity model enums, default thinking levels, and the currently"
+        "List all available built-in, dynamically auto-discovered, and custom"
+        " target models supported by the router, their Antigravity model enums,"
+        " default thinking levels, suggested_tier_models, and the currently"
         " configured tier_models mapping (`flash_lite`, `flash`, `pro`)."
     ),
     "inputSchema": {
         "type": "object",
         "additionalProperties": False,
-        "properties": {},
+        "properties": {
+            "refresh": {
+                "type": "boolean",
+                "description": (
+                    "Force live re-discovery of newly available models from"
+                    " Antigravity LS and agy CLI (default: false)."
+                ),
+            },
+        },
     },
     "annotations": {"readOnlyHint": True, "openWorldHint": False},
 }
@@ -457,11 +466,30 @@ class McpServer:
           route_kwargs["tier_models"] = tier_models
         res = self._route_fn(prompt, **route_kwargs)
       elif name == "list_models":
+        unknown_lm = set(arguments.keys()) - {"refresh"}
+        if unknown_lm:
+          raise decisions_engine.InvalidInputError(
+              f"Unsupported list_models keys: {sorted(unknown_lm)}"
+          )
+        if "refresh" in arguments and not isinstance(
+            arguments["refresh"], bool
+        ):
+          raise decisions_engine.InvalidInputError(
+              "refresh must be a boolean"
+          )
+        refresh_flag = bool(arguments.get("refresh", False))
         tier_models, custom_enums = _load_router_model_config(self._config_path)
-        res = decisions_engine.list_available_target_models(
-            tier_models=tier_models,
-            custom_model_enums=custom_enums,
-        )
+        try:
+          res = decisions_engine.list_available_target_models(
+              tier_models=tier_models,
+              custom_model_enums=custom_enums,
+              refresh_discovered=refresh_flag,
+          )
+        except TypeError:
+          res = decisions_engine.list_available_target_models(
+              tier_models=tier_models,
+              custom_model_enums=custom_enums,
+          )
       elif name == "configure_router":
         updates = _validate_configure_args(arguments)
         updated_cfg = (

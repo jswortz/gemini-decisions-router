@@ -14,7 +14,8 @@ Traditional LLM routers generate JSON text token-by-token, adding 400 to 1,500 m
 - **Universal `"✦ Routed with Intent"` Visibility (0 Model Tokens):** Renders inline `metadata.user_markdown` routing banners in **both** the Antigravity Desktop App and `agy` CLI with `"systemMessage": ""` (zero prompt token overhead), alongside `PreToolUse` subagent notices, 4 verbosity presets (`silent`, `compact`, `normal`, `verbose`), live terminal streaming (`agy-router watch`), and historical summaries (`agy-router stats`).
 - **Asymmetric Thread Floor & Multi-Step Deduplication:** Prevents mid-conversation downgrades on Turn 2+ so short replies like `"yes go ahead"` never drop an active `pro` session down to `flash_lite`, and deduplicates multi-step tool loops so Steps 2..N execute in `<1 ms` with zero extra API calls or duplicate banners.
 - **Automatic Subagent Right-Sizing (`PreToolUse`):** Intercepts `invoke_subagent` calls when `Model` is unset or `"inherit"` and assigns `flash_lite`, `flash`, or `pro` based on each subagent's task.
-- **4 MCP Tools (`create_decision`, `route_prompt`, `list_models`, `configure_router`):** Exposes calibrated decision gates, prompt classification, target model discovery, and live router configuration directly to your agents.
+- **Dynamic Model Auto-Discovery (`sync-models` & `list-models --refresh`):** Automatically discovers newly released Antigravity Desktop App and `agy` CLI models at runtime (for example `gemini-3.8-flash-medium` or `gemini-next-pro-high`), classifies each model into `flash_lite`, `flash`, or `pro` with an inferred thinking level, caches results in `~/.cache/gemini-decisions-router/discovered_models.json` (`0600`), and supports one-step adoption via `agy-router sync-models --apply-recommended`.
+- **4 MCP Tools (`create_decision`, `route_prompt`, `list_models`, `configure_router`):** Exposes calibrated decision gates, prompt classification, live target model discovery (`list_models(refresh=true)`), and live router configuration directly to your agents.
 - **Pure Python 3.11+ Standard Library:** Runs out of the box with zero mandatory `pip` packages. Automatically uses `google-auth` if present, and falls back to native stdlib OAuth2 refresh and GCE/Cloud Run/GKE Metadata Server queries.
 
 ## Authentication Modes
@@ -170,19 +171,32 @@ agy-router set-mode auto_switch --min-confidence 0.55
 agy-router set-mode off
 ```
 
-## Configurable Target Models
+## Dynamic Model Auto-Discovery & Configurable Target Models
 
-Inspect the 10 built-in target models (across Gemini 3.1/3/2.5, Claude Sonnet/Opus 4.6, and GPT-OSS) and customize which model handles `flash_lite`, `flash`, and `pro` tiers:
+In addition to the 10 built-in target models (across Gemini 3.1/3/2.5, Claude Sonnet/Opus 4.6, and GPT-OSS), the router dynamically discovers newly released models directly from your local Antigravity Language Server (`GetAvailableModels`) and `agy models` CLI at runtime:
+
+- **Automatic Tier & Thinking Classification:** Newly discovered models (such as `gemini-3.8-flash-medium`, `gemini-next-pro-high`, or `gemini-pro-orchestrator`) are automatically classified into `flash_lite`, `flash`, or `pro` with calibrated default thinking levels (`1..4`), and any Antigravity model enums returned by the Language Server are merged automatically for `auto_switch` redispatch.
+- **Private `0600` Discovery Cache:** Discovered models are cached in `~/.cache/gemini-decisions-router/discovered_models.json` (`0700` directory, `0600` file, `3600s` TTL) so `PreInvocation` hooks and status checks read them in `<1 ms` without spawning subprocesses.
+- **Immediate Adoption:** Discovered models are immediately selectable via `agy-router set-models`, `configure_router`, or one-command `agy-router sync-models --apply-recommended`.
 
 ```bash
-# List all available target models, Antigravity enums, and active tier mappings
+# Discover newly released Antigravity / agy CLI models and view suggested_tier_models
+agy-router sync-models
+
+# Discover models and persist suggested_tier_models into router_config.json
+agy-router sync-models --apply-recommended
+
+# List all built-in, discovered, and custom target models (auto-populates cache on first run)
 agy-router list-models
 
-# Customize tier targets persistently
+# Force a live re-discovery refresh from Antigravity LS and agy CLI
+agy-router list-models --refresh
+
+# Customize tier targets persistently (supports built-in or newly discovered model IDs)
 agy-router set-models \
   --flash-lite gemini-3.1-flash-lite \
-  --flash gemini-3-flash \
-  --pro claude-opus-4-6
+  --flash gemini-3.8-flash-medium \
+  --pro gemini-next-pro-high
 
 # Reset back to built-in defaults
 agy-router set-models --reset
@@ -237,7 +251,13 @@ Scores any prompt or subagent task description using Tier 0 fast rules plus Tier
 
 ### 3. `list_models`
 
-Lists all built-in and custom target models, their Antigravity model enums, default thinking effort levels, and the active `tier_models` mapping.
+Lists all built-in, dynamically auto-discovered (`~/.cache/gemini-decisions-router/discovered_models.json`), and custom target models, their Antigravity model enums, default thinking effort levels, `suggested_tier_models`, and the active `tier_models` mapping. Pass `{"refresh": true}` to force live re-discovery from the local Antigravity Language Server and `agy` CLI:
+
+```json
+{
+  "refresh": true
+}
+```
 
 ### 4. `configure_router`
 
@@ -270,9 +290,9 @@ agy plugin validate . --strict
 
 - `plugin.json`, `mcp_config.json`, `hooks.json`: Antigravity plugin (`category: "agents"`), MCP, and hook manifests
 - `install.sh`: Installer for `~/.gemini/config/plugins/gemini-decisions-router`, `~/.local/bin/agy-router`, and `agy plugin validate --strict`
-- `decisions_engine.py`: Keyless ADC resolver, `0600` `.env` loader, Decisions HTTP client, input/file security validator, and 2-tier router
+- `decisions_engine.py`: Keyless ADC resolver, `0600` `.env` loader, Decisions HTTP client, input/file security validator, dynamic Antigravity / `agy` model auto-discovery, and 2-tier router
 - `mcp_server.py`: Stdio JSON-RPC 2.0 MCP server (`create_decision`, `route_prompt`, `list_models`, `configure_router`)
-- `router_hook.py`: `PreInvocation` / `PreToolUse` hooks and `agy-router` CLI (`auth-setup`, `auth-check`, `status`, `route`, `watch`, `stats`, `set-mode`, `set-verbosity`, `list-models`, `set-models`)
+- `router_hook.py`: `PreInvocation` / `PreToolUse` hooks and `agy-router` CLI (`auth-setup`, `auth-check`, `status`, `route`, `watch`, `stats`, `set-mode`, `set-verbosity`, `list-models`, `sync-models`, `set-models`)
 - `skills/gemini-decisions-router/SKILL.md`: Agent skill reference loaded by Antigravity
 - `docs/CUSTOMER_ONBOARDING.md`: Enterprise Google Cloud customer rollout guide
 - `docs/AUTHENTICATION_ADC.md`: Keyless ADC architecture and troubleshooting guide

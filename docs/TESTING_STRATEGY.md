@@ -2,15 +2,33 @@
 
 This document describes how **Gemini Decisions Router** lists and configures target models, how security boundaries, UI visibility, multi-step deduplication, and `auto_switch` anti-hang guards are verified in automated tests, and the live verification results generated from `telemetry.jsonl`.
 
-## 1. Available Target Models & Configuration
+## 1. Available Target Models, Dynamic Auto-Discovery, & Configuration
 
-List all built-in and custom target models along with active tier assignments:
+List all built-in, dynamically auto-discovered, and custom target models along with active tier assignments:
 
 ```bash
+# List built-in + cached/discovered models (auto-populates cache on first run)
 agy-router list-models
+
+# Force live re-discovery from local Antigravity Language Server + agy CLI
+agy-router list-models --refresh
+
+# Sync newly released models and inspect suggested_tier_models
+agy-router sync-models
+
+# Sync newly released models and persist suggested_tier_models automatically
+agy-router sync-models --apply-recommended
 ```
 
-Built-in target model catalog (10 models):
+### Dynamic Runtime Model Auto-Discovery
+
+Whenever new models are released in Antigravity or `agy` CLI (for example `gemini-3.8-flash-medium`, `gemini-next-pro-high`, or `gemini-pro-orchestrator`), the router automatically discovers them without requiring code changes:
+
+- **Dual Discovery Sources:** Queries `POST /exa.language_server_pb.LanguageServerService/GetAvailableModels` on the local Antigravity Language Server (capturing live Antigravity model enums so `auto_switch` works out of the box) and merges model IDs and display labels from `agy models`.
+- **Automatic Tier & Thinking Inference:** Classifies discovered models into `flash_lite`, `flash`, or `pro` with calibrated default thinking levels (`1..4`) and computes `suggested_tier_models`.
+- **Private `0600` Cache:** Stores discovered models in `~/.cache/gemini-decisions-router/discovered_models.json` (`0700` directory, `0600` file, `3600s` TTL) so runtime hooks read enums in `<1 ms` without blocking on subprocesses.
+
+Built-in target model catalog (10 baseline models):
 
 | Model ID | Provider | Default Tier | Antigravity Model Enum | Default Thinking |
 | :--- | :--- | :--- | :--- | :--- |
@@ -48,7 +66,7 @@ Or override temporarily via environment variables (highest precedence):
 - `GEMINI_DECISIONS_MODEL_FLASH`
 - `GEMINI_DECISIONS_MODEL_PRO`
 
-Agents can also inspect and update target models at runtime via the `list_models` and `configure_router` MCP tools.
+Agents can also inspect, live-refresh, and update target models at runtime via the `list_models` (`{"refresh": true}`) and `configure_router` MCP tools.
 
 ## 2. Testing Strategy & Hardening Verification
 
@@ -92,7 +110,13 @@ Antigravity invokes `PreInvocation` before **every** model step inside a multi-s
 - Verifies `configure_router` updates `verbosity`, `mode`, `min_confidence`, `enable_subagent_routing`, and `tier_models` in `router_config.json`.
 - Verifies `auth-setup`, `watch --once`, `stats`, `route --pretty`, and the tightened `1.5s` default hook HTTP timeout budget (`GEMINI_DECISIONS_HOOK_TIMEOUT_S`, clamped to `[0.3, 8.0]`).
 
-### F. Strict Plugin Validation & Repository Hygiene (`agy plugin validate --strict`)
+### F. Dynamic Model Auto-Discovery & Unit-Test Hermeticity (`test_dynamic_model_discovery_cli_and_ls_parsing`)
+
+- **ANSI Spinner & Language Server Parsing:** Verifies `parse_agy_models_output` strips terminal ANSI sequences and carriage-return spinner prefixes from `agy models`, `discover_models_from_ls` extracts model IDs, labels, and Antigravity model enums from `GetAvailableModels`, and `infer_model_tier_and_thinking` maps `-low`, `-medium`, `-high`, `lite`, `flash`, `pro`, and `orchestrator` variants accurately.
+- **Private `0600` Cache & CLI/MCP Integration:** Verifies `discover_installed_models` writes `~/.cache/gemini-decisions-router/discovered_models.json` with `0600` permissions, `suggest_tier_models` recommends optimal `flash_lite` / `flash` / `pro` candidates, `agy-router sync-models --apply-recommended` and `agy-router list-models --refresh` update and display discovered models, and MCP `list_models` honors `{"refresh": false}` / `{"refresh": true}`.
+- **Hermeticity:** Verifies that passing an explicit `environ` dict to `list_available_target_models(environ=...)` in unit tests never reads the user's `~/.cache/gemini-decisions-router/discovered_models.json` or spawns external CLI processes.
+
+### G. Strict Plugin Validation & Repository Hygiene (`agy plugin validate --strict`)
 
 - **`agy plugin validate . --strict`:** Validates `plugin.json` (including `"category": "agents"`), `mcp_config.json`, `hooks.json`, `assets/logo.svg`, and `skills/gemini-decisions-router/SKILL.md` with zero warnings or errors (also executed automatically during `./install.sh`).
 - **Repository Hygiene Tests:** `test_zero_internal_google_references`, `test_config_rejects_embedded_secrets`, `test_file_security_blocks_symlinks_dotfiles_and_secrets`, and `test_docs_contain_no_em_or_en_dashes` enforce zero internal endpoints/identifiers, zero embedded secrets, strict path-traversal/symlink blocks, and ASCII-clean markdown across every documentation and skill file.

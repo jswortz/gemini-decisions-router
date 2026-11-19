@@ -14,7 +14,7 @@ This plugin connects the Antigravity Desktop App and `agy` CLI to the Gemini Dec
    - `choice`: Discrete multiple-choice map (2 to 255 options) returning `choice`, `confidence`, and normalized `probabilities`.
    - `score`: Ordered rubric array (2 to 255 levels, index `0..N-1`) returning expected `score`, modal `level`, `confidence`, and per-level `probabilities`.
 2. `route_prompt`: Classifies a prompt or subagent task using Tier 0 (`<1 ms`) fast rules plus a single-pass `create_decision` call, returning `recommended_tier` (`flash_lite`, `flash`, `pro`), `recommended_model_id`, `thinking_level` (`1..4`), `confidence`, and `probabilities`.
-3. `list_models`: Lists all built-in and custom target models, their Antigravity model enums, default thinking levels, and active `tier_models` (`flash_lite`, `flash`, `pro`).
+3. `list_models`: Lists all built-in, dynamically auto-discovered (`~/.cache/gemini-decisions-router/discovered_models.json`), and custom target models, their Antigravity model enums, default thinking levels, `suggested_tier_models`, and active `tier_models` (`flash_lite`, `flash`, `pro`). Pass optional `{"refresh": true}` to force live re-discovery from the local Antigravity Language Server and `agy` CLI.
 4. `configure_router`: Updates persistent settings in `~/.config/gemini-decisions-router/router_config.json` and returns the updated config plus `active_tier_models`. Supported fields:
    - `mode`: `"advisor"` | `"auto_switch"` | `"off"`
    - `verbosity`: `"silent"` | `"compact"` | `"normal"` | `"verbose"`
@@ -27,7 +27,7 @@ This plugin connects the Antigravity Desktop App and `agy` CLI to the Gemini Dec
 - `PreInvocation`:
   - Scores Step 1 of each explicit user turn (`1.5s` default hook HTTP deadline via `GEMINI_DECISIONS_HOOK_TIMEOUT_S`), enforces Turn 2+ asymmetric thread floors so short follow-ups (`"yes"`, `"ship it"`) never downgrade an active `pro` thread, and deduplicates multi-step tool loops (`<1 ms` on Steps 2..N).
   - Emits zero-token inline `"✦ Routed with Intent"` banners via `systemMessage.metadata.user_markdown` (`"systemMessage": ""`) across both the Antigravity Desktop App and `agy` CLI according to `verbosity` (`silent`, `compact`, `normal`, `verbose`).
-  - In `auto_switch` mode, runs a `GetCascadeTrajectory` ownership pre-flight check before terminating a turn; if the Language Server does not own the cascade (such as in `agy` CLI), it automatically falls back to `advisor` mode so turns never hang.
+  - In `auto_switch` mode, merges built-in, cached auto-discovered, and custom Antigravity model enums and runs a `GetCascadeTrajectory` ownership pre-flight check before terminating a turn; if the Language Server does not own the cascade (such as in `agy` CLI), it automatically falls back to `advisor` mode so turns never hang.
 - `PreToolUse` (`invoke_subagent`): When `Model` is unset or `"inherit"`, assigns `flash_lite`, `flash`, or `pro` and includes a `"✦ Routed with Intent"` tool `reason` notice (omitted when `verbosity` is `"silent"`).
 
 ## `agy-router` CLI Reference
@@ -67,9 +67,14 @@ agy-router set-mode advisor
 agy-router set-mode auto_switch --min-confidence 0.55
 agy-router set-verbosity compact   # silent | compact | normal | verbose
 
+# Discover newly released Antigravity / agy CLI models and cache in discovered_models.json (0600)
+agy-router sync-models
+agy-router sync-models --apply-recommended
+
 # List or customize target models mapped to flash_lite, flash, and pro
 agy-router list-models
-agy-router set-models --flash-lite gemini-3.1-flash-lite --flash gemini-3-flash --pro claude-opus-4-6
+agy-router list-models --refresh
+agy-router set-models --flash-lite gemini-3.1-flash-lite --flash gemini-3.8-flash-medium --pro gemini-next-pro-high
 agy-router set-models --reset
 ```
 

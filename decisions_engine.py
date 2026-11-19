@@ -13,7 +13,7 @@ standard library (with optional `google-auth` acceleration when installed):
 from __future__ import annotations
 
 import base64
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import json
 import math
@@ -1681,50 +1681,778 @@ def resolve_tier_models(
   return resolved
 
 
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[@-_][0-?]*[ -/]*[@-~]"
+)
+_AGY_MODEL_LINE_RE = re.compile(
+    r"^([a-z0-9][a-z0-9._@-]{2,80})(?:\t+|\s{2,})(.+)$"
+)
+_SKIP_LOG_PREFIX_RE = re.compile(
+    r"^(?:ERROR:|WARN(?:ING)?:|INFO:|Fetching\b|[IWEF]\d{2,4}\b)",
+    re.IGNORECASE,
+)
+_DISCOVERED_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]{1,80}$")
+_SAFE_MODEL_ENUM_RE = re.compile(r"^[A-Z0-9_]{3,96}$")
+_CSRF_TOKEN_RE = re.compile(r'["\']csrfToken["\']\s*:\s*["\']([^"\']+)["\']')
+_VERSION_PAIR_RE = re.compile(r"(?:^|[-_ ])(\d+)(?:\.(\d+))?(?=$|[-_ )])")
+_LITE_TOKEN_RE = re.compile(r"(?<![a-z])(?:lite|nano)(?![a-z])")
+_FLASH_WORD_RE = re.compile(r"(?<![a-z])flash(?![a-z])")
+_FLASH_TOKEN_RE = re.compile(
+    r"(?<![a-z])(?:flash|mini|haiku|fast)(?![a-z])"
+)
+_PRO_CLASS_TOKEN_RE = re.compile(
+    r"(?<![a-z])(?:pro|opus|ultra|orchestrator)(?![a-z])"
+)
+
+
+def default_discovered_models_path() -> pathlib.Path:
+  """Returns the default user-private cache path for auto-discovered models."""
+  return (
+      pathlib.Path.home()
+      / ".cache"
+      / "gemini-decisions-router"
+      / "discovered_models.json"
+  )
+
+
+def _infer_provider(
+    model_id: str, label: str = "", raw_provider: str = ""
+) -> str:
+  combined = f"{model_id} {label} {raw_provider}".lower()
+  if "claude" in combined or "anthropic" in combined:
+    return "anthropic"
+  if "gpt" in combined or "openai" in combined:
+    return "openai"
+  return "google"
+
+
+def infer_model_tier_and_thinking(
+    model_id: str, label: str = ""
+) -> tuple[str, int]:
+  """Infers router tier ('flash_lite'|'flash'|'pro') and thinking level (1..4)."""
+  mid = (model_id or "").strip().lower()
+  lbl = (label or "").strip().lower()
+  combined = f"{mid} {lbl}"
+
+  has_low = "-low" in mid or "(low)" in lbl
+  has_lite = bool(_LITE_TOKEN_RE.search(combined))
+  has_flash = bool(_FLASH_WORD_RE.search(combined))
+  if has_lite or (has_flash and has_low):
+    tier = "flash_lite"
+  elif _FLASH_TOKEN_RE.search(combined):
+    tier = "flash"
+  else:
+    tier = "pro"
+
+  if "-max" in mid or "(max)" in lbl:
+    thinking = 4
+  elif (
+      "-high" in mid
+      or "-xhigh" in mid
+      or "(high)" in lbl
+      or "(xhigh)" in lbl
+  ):
+    if _PRO_CLASS_TOKEN_RE.search(combined):
+      thinking = 4
+    else:
+      thinking = 3
+  elif has_low or has_lite:
+    thinking = 1
+  else:
+    thinking = 2
+
+  return tier, thinking
+
+
+def parse_agy_models_output(raw_output: str) -> list[dict[str, Any]]:
+  """Parses `agy models` CLI output into normalized discovered model dicts."""
+  if not isinstance(raw_output, str) or not raw_output:
+    return []
+  cleaned = _ANSI_ESCAPE_RE.sub("", raw_output).replace("\r\n", "\n")
+  out: list[dict[str, Any]] = []
+  seen: set[str] = set()
+  for raw_line in cleaned.split("\n"):
+    line = raw_line.rstrip("\r")
+    if "\r" in line:
+      line = line.rsplit("\r", 1)[-1]
+    line = line.strip()
+    if not line or _SKIP_LOG_PREFIX_RE.match(line):
+      continue
+    m = _AGY_MODEL_LINE_RE.match(line)
+    if not m:
+      continue
+    mid = m.group(1).strip()
+    label = m.group(2).strip()
+    if not mid or not label or mid in ("auto", "model", "models", "name"):
+      continue
+    if _SKIP_LOG_PREFIX_RE.match(label) or mid in seen:
+      continue
+    seen.add(mid)
+    tier, thinking = infer_model_tier_and_thinking(mid, label)
+    out.append({
+        "id": mid,
+        "label": label,
+        "provider": _infer_provider(mid, label),
+        "tier": tier,
+        "enum": "",
+        "default_thinking_level": thinking,
+        "description": "Auto-discovered from agy CLI",
+        "source": "discovered_cli",
+    })
+  return out
+
+
+def _normalize_local_ls_addr(raw_addr: str) -> str:
+  addr = (raw_addr or "").strip()
+  if not addr:
+    return ""
+  if "://" not in addr:
+    addr = f"http://{addr}"
+  parsed = urllib.parse.urlsplit(addr)
+  host = (parsed.hostname or "").lower()
+  port = parsed.port
+  if parsed.scheme != "http" or host not in ("127.0.0.1", "localhost") or not port:
+    return ""
+  return f"{host}:{port}"
+
+
+def _parse_ls_models_payload(payload: Any) -> list[dict[str, Any]]:
+  body = (
+      payload.get("response")
+      if isinstance(payload, Mapping)
+      and isinstance(payload.get("response"), Mapping)
+      else payload
+  )
+  if not isinstance(body, Mapping):
+    return []
+
+  excluded_ids: set[str] = {"auto"}
+  for list_key in (
+      "tabModelIds",
+      "imageGenerationModelIds",
+      "audioTranscriptionModelIds",
+  ):
+    raw_list = body.get(list_key)
+    if isinstance(raw_list, list):
+      for item in raw_list:
+        if isinstance(item, str) and item.strip():
+          excluded_ids.add(item.strip())
+  deprecated = body.get("deprecatedModelIds")
+  if isinstance(deprecated, Mapping):
+    for k in deprecated:
+      excluded_ids.add(str(k).strip())
+  elif isinstance(deprecated, list):
+    for item in deprecated:
+      if isinstance(item, str) and item.strip():
+        excluded_ids.add(item.strip())
+
+  sort_ids: list[str] = []
+  sort_ids_set: set[str] = set()
+  raw_sorts = body.get("agentModelSorts")
+  if isinstance(raw_sorts, list):
+    for sort_entry in raw_sorts:
+      if not isinstance(sort_entry, Mapping):
+        continue
+      groups = sort_entry.get("groups")
+      if not isinstance(groups, list):
+        continue
+      for grp in groups:
+        if not isinstance(grp, Mapping):
+          continue
+        mids = grp.get("modelIds")
+        if not isinstance(mids, list):
+          continue
+        for mid_item in mids:
+          s_mid = str(mid_item or "").strip()
+          if s_mid and s_mid != "auto" and s_mid not in sort_ids_set:
+            sort_ids.append(s_mid)
+            sort_ids_set.add(s_mid)
+
+  candidates: list[tuple[str, Mapping[str, Any], bool]] = []
+  raw_models = body.get("models")
+  if isinstance(raw_models, Mapping):
+    for s_mid in sort_ids:
+      info = raw_models.get(s_mid)
+      if isinstance(info, Mapping):
+        candidates.append((s_mid, info, True))
+    for k_mid, info in raw_models.items():
+      s_mid = str(k_mid or "").strip()
+      if s_mid in sort_ids_set or not isinstance(info, Mapping):
+        continue
+      candidates.append((s_mid, info, False))
+  elif isinstance(raw_models, list):
+    for info in raw_models:
+      if not isinstance(info, Mapping):
+        continue
+      moa = (
+          info.get("modelOrAlias")
+          if isinstance(info.get("modelOrAlias"), Mapping)
+          else {}
+      )
+      s_mid = str(
+          info.get("id")
+          or info.get("modelId")
+          or info.get("alias")
+          or moa.get("alias")
+          or ""
+      ).strip()
+      candidates.append((s_mid, info, True))
+
+  raw_client_cfgs = body.get("clientModelConfigs")
+  if isinstance(raw_client_cfgs, list):
+    for info in raw_client_cfgs:
+      if not isinstance(info, Mapping):
+        continue
+      moa = (
+          info.get("modelOrAlias")
+          if isinstance(info.get("modelOrAlias"), Mapping)
+          else {}
+      )
+      s_mid = str(
+          info.get("id")
+          or info.get("modelId")
+          or info.get("alias")
+          or moa.get("alias")
+          or ""
+      ).strip()
+      if not s_mid:
+        raw_lbl = str(info.get("label") or info.get("displayName") or "").strip()
+        if raw_lbl:
+          s_mid = re.sub(r"[^a-z0-9.]+", "-", raw_lbl.lower()).strip("-")
+      candidates.append((s_mid, info, True))
+
+  out: list[dict[str, Any]] = []
+  seen: set[str] = set()
+  for mid, info, from_primary_list in candidates:
+    if (
+        not mid
+        or mid in seen
+        or mid in excluded_ids
+        or "/" in mid
+        or not _DISCOVERED_ID_RE.fullmatch(mid)
+    ):
+      continue
+    if info.get("isInternal"):
+      continue
+
+    raw_label = str(info.get("label") or info.get("displayName") or "").strip()
+    if sort_ids_set and not from_primary_list:
+      if "ignoreExperimentNames" in info or not raw_label:
+        continue
+      if mid.endswith(("-dropdown", "-tiered", "-worker")):
+        continue
+      m_id_dec = re.search(r"(\d+\.\d+)", mid)
+      m_lbl_dec = re.search(r"(\d+\.\d+)", raw_label)
+      if m_id_dec and m_lbl_dec and m_id_dec.group(1) != m_lbl_dec.group(1):
+        continue
+
+    label = raw_label or mid
+    moa = (
+        info.get("modelOrAlias")
+        if isinstance(info.get("modelOrAlias"), Mapping)
+        else {}
+    )
+    raw_enum = str(
+        info.get("enum") or info.get("model") or moa.get("model") or ""
+    ).strip()
+    enum_val = raw_enum if _SAFE_MODEL_ENUM_RE.fullmatch(raw_enum) else ""
+    raw_prov = str(
+        info.get("provider")
+        or info.get("modelProvider")
+        or info.get("apiProvider")
+        or ""
+    ).strip()
+    tier, thinking = infer_model_tier_and_thinking(mid, label)
+    seen.add(mid)
+    out.append({
+        "id": mid,
+        "label": label,
+        "provider": _infer_provider(mid, label, raw_prov),
+        "tier": tier,
+        "enum": enum_val,
+        "default_thinking_level": thinking,
+        "description": "Auto-discovered from Antigravity Language Server",
+        "source": "discovered_ls",
+    })
+  return out
+
+
+def discover_models_from_ls(
+    ls_addr: str = "",
+    csrf_token: str = "",
+    timeout_s: float = 0.6,
+) -> list[dict[str, Any]]:
+  """Queries local Antigravity Language Server GetAvailableModels RPC."""
+  opener = urllib.request.build_opener(
+      _NoRedirectHandler(), urllib.request.ProxyHandler({})
+  )
+  eff_timeout = max(0.1, float(timeout_s))
+
+  def _fetch_csrf(candidate: str) -> str:
+    try:
+      req = urllib.request.Request(f"http://{candidate}/", method="GET")
+      with opener.open(req, timeout=min(eff_timeout, 0.4)) as resp:
+        html = resp.read(65536).decode("utf-8", "replace")
+      m = _CSRF_TOKEN_RE.search(html)
+      return m.group(1) if m else ""
+    except Exception:  # pylint: disable=broad-except
+      return ""
+
+  def _call_get_models(target_addr: str, target_csrf: str) -> list[dict[str, Any]]:
+    rpc_url = (
+        f"http://{target_addr}"
+        "/exa.language_server_pb.LanguageServerService/GetAvailableModels"
+    )
+    req = urllib.request.Request(
+        rpc_url,
+        data=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+            "x-codeium-csrf-token": target_csrf,
+        },
+        method="POST",
+    )
+    try:
+      with opener.open(req, timeout=eff_timeout) as resp:
+        raw = resp.read(2 * 1024 * 1024)
+      parsed = json.loads(raw.decode("utf-8"))
+      return _parse_ls_models_payload(parsed)
+    except Exception:  # pylint: disable=broad-except
+      return []
+
+  if ls_addr and ls_addr.strip():
+    addr = _normalize_local_ls_addr(ls_addr)
+    if not addr:
+      return []
+    csrf = (csrf_token or "").strip() or _fetch_csrf(addr)
+    if not csrf:
+      return []
+    return _call_get_models(addr, csrf)
+
+  attempts: list[tuple[str, str]] = []
+  env_addr = _normalize_local_ls_addr(
+      os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
+  )
+  env_csrf = (
+      csrf_token or os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
+  ).strip()
+  if env_addr:
+    attempts.append((env_addr, env_csrf))
+  if env_addr != "127.0.0.1:5387":
+    attempts.append(("127.0.0.1:5387", ""))
+
+  for cand_addr, cand_csrf in attempts:
+    tok = cand_csrf or _fetch_csrf(cand_addr)
+    if not tok:
+      continue
+    found = _call_get_models(cand_addr, tok)
+    if found:
+      return found
+  return []
+
+
+def _normalize_cached_model_entry(entry: Mapping[str, Any]) -> dict[str, Any] | None:
+  mid = str(entry.get("id") or "").strip()
+  if not mid or mid == "auto" or not _DISCOVERED_ID_RE.fullmatch(mid):
+    return None
+  label = str(entry.get("label") or mid).strip() or mid
+  inf_tier, inf_think = infer_model_tier_and_thinking(mid, label)
+  tier = str(entry.get("tier") or "").strip()
+  if tier not in TIER_RANKS:
+    tier = inf_tier
+  raw_enum = str(entry.get("enum") or "").strip()
+  enum_val = raw_enum if _SAFE_MODEL_ENUM_RE.fullmatch(raw_enum) else ""
+  raw_think = entry.get("default_thinking_level")
+  thinking = (
+      max(1, min(4, int(raw_think)))
+      if isinstance(raw_think, int) and not isinstance(raw_think, bool)
+      else inf_think
+  )
+  provider = str(entry.get("provider") or "").strip() or _infer_provider(
+      mid, label
+  )
+  description = (
+      str(entry.get("description") or "Auto-discovered target model.").strip()
+      or "Auto-discovered target model."
+  )
+  source = str(entry.get("source") or "discovered").strip() or "discovered"
+  return {
+      "id": mid,
+      "label": label,
+      "provider": provider,
+      "tier": tier,
+      "enum": enum_val,
+      "default_thinking_level": thinking,
+      "description": description,
+      "source": source,
+  }
+
+
+def _resolve_agy_binary(agy_bin: str | None) -> str:
+  if agy_bin is not None:
+    cand = str(agy_bin).strip()
+    if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+      return cand
+    return ""
+  found = shutil.which("agy")
+  if found and os.path.isfile(found) and os.access(found, os.X_OK):
+    return found
+  fallback = pathlib.Path.home() / ".local" / "bin" / "agy"
+  try:
+    if fallback.is_file() and os.access(fallback, os.X_OK):
+      return str(fallback)
+  except OSError:
+    pass
+  return ""
+
+
+def _write_discovered_cache(
+    cache_file: pathlib.Path, models: list[dict[str, Any]]
+) -> None:
+  try:
+    cache_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+      os.chmod(cache_file.parent, 0o700)
+    except OSError:
+      pass
+    try:
+      st = os.lstat(cache_file)
+      if stat.S_ISLNK(st.st_mode):
+        return
+    except FileNotFoundError:
+      pass
+    payload = json.dumps(
+        {"updated_at": time.time(), "models": models},
+        indent=2,
+        ensure_ascii=False,
+    ).encode("utf-8") + b"\n"
+    tmp_path = cache_file.parent / (
+        f".{cache_file.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    fd = os.open(
+        tmp_path,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+      os.write(fd, payload)
+    finally:
+      os.close(fd)
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, cache_file)
+    os.chmod(cache_file, 0o600)
+  except OSError:
+    pass
+
+
+def discover_installed_models(
+    *,
+    agy_bin: str | None = None,
+    cache_path: str | os.PathLike[str] | None = None,
+    force_refresh: bool = False,
+    max_age_s: float = 3600.0,
+    run_cli_fallback: bool = True,
+) -> list[dict[str, Any]]:
+  """Discovers models from cache, Antigravity LS, and optional `agy models` CLI."""
+  cpath = (
+      pathlib.Path(cache_path).expanduser()
+      if cache_path is not None
+      else default_discovered_models_path()
+  )
+
+  if not force_refresh and max_age_s > 0:
+    try:
+      st = os.lstat(cpath)
+      if stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+        data = json.loads(cpath.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("models"), list):
+          updated_at = float(data.get("updated_at", 0.0))
+          if (time.time() - updated_at) < max_age_s:
+            cached_out: list[dict[str, Any]] = []
+            seen_cached: set[str] = set()
+            for item in data["models"]:
+              if isinstance(item, Mapping):
+                norm = _normalize_cached_model_entry(item)
+                if norm is not None and norm["id"] not in seen_cached:
+                  seen_cached.add(norm["id"])
+                  cached_out.append(norm)
+            return cached_out
+    except (OSError, ValueError, TypeError):
+      pass
+
+  ls_models = discover_models_from_ls()
+  cli_models: list[dict[str, Any]] = []
+  if run_cli_fallback:
+    agy_path = _resolve_agy_binary(agy_bin)
+    if agy_path:
+      try:
+        proc = subprocess.run(
+            [agy_path, "models"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=8.0,
+            check=False,
+        )
+        if proc.returncode == 0:
+          cli_models = parse_agy_models_output(proc.stdout or "")
+          if not cli_models and proc.stderr:
+            cli_models = parse_agy_models_output(proc.stderr)
+      except (OSError, subprocess.SubprocessError):
+        cli_models = []
+
+  merged_by_id: dict[str, dict[str, Any]] = {}
+  ordered_ids: list[str] = []
+
+  for cli_item in cli_models:
+    mid = str(cli_item["id"])
+    if mid not in merged_by_id:
+      merged_by_id[mid] = dict(cli_item)
+      ordered_ids.append(mid)
+
+  for ls_item in ls_models:
+    mid = str(ls_item["id"])
+    if mid in merged_by_id:
+      existing = merged_by_id[mid]
+      ls_enum = str(ls_item.get("enum") or "").strip()
+      if ls_enum and not existing.get("enum"):
+        existing["enum"] = ls_enum
+      cli_label = str(existing.get("label") or "").strip()
+      ls_label = str(ls_item.get("label") or "").strip()
+      best_label = (
+          cli_label
+          if cli_label and cli_label != mid
+          else (ls_label or cli_label or mid)
+      )
+      existing["label"] = best_label
+      tier, thinking = infer_model_tier_and_thinking(mid, best_label)
+      existing["tier"] = tier
+      existing["default_thinking_level"] = thinking
+      existing["provider"] = _infer_provider(
+          mid, best_label, str(ls_item.get("provider") or "")
+      )
+    else:
+      merged_by_id[mid] = dict(ls_item)
+      ordered_ids.append(mid)
+
+  merged = [merged_by_id[mid] for mid in ordered_ids]
+  if merged:
+    _write_discovered_cache(cpath, merged)
+  return merged
+
+
+def _extract_model_version(model_id: str) -> tuple[int, int]:
+  m = _VERSION_PAIR_RE.search(model_id.lower())
+  if not m:
+    return (0, 0)
+  major = int(m.group(1))
+  minor = int(m.group(2)) if m.group(2) is not None else 0
+  return (major, minor)
+
+
+def suggest_tier_models(models: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+  """Selects the best model per tier, preferring discovered models over defaults."""
+  best_by_tier: dict[str, tuple[tuple[int, ...], str]] = {}
+
+  for entry in models:
+    if not isinstance(entry, Mapping):
+      continue
+    mid = str(entry.get("id") or "").strip()
+    if not mid or mid == "auto":
+      continue
+    label = str(entry.get("label") or mid).strip() or mid
+    mid_low = mid.lower()
+    lbl_low = label.lower()
+    combined = f"{mid_low} {lbl_low}"
+
+    tier = str(entry.get("tier") or "").strip()
+    if tier not in TIER_RANKS:
+      tier, _ = infer_model_tier_and_thinking(mid, label)
+
+    provider = (
+        str(entry.get("provider") or "").strip().lower()
+        or _infer_provider(mid, label)
+    )
+    src = str(entry.get("source") or "").strip().lower()
+    ver_major, ver_minor = _extract_model_version(mid_low)
+
+    is_novel_id = mid not in MODEL_ENUMS
+    is_discovered = (
+        (src.startswith("discovered") and is_novel_id)
+        or (not src and is_novel_id)
+    ) and (ver_major == 0 or ver_major >= 3)
+
+    if tier == "flash_lite":
+      if _LITE_TOKEN_RE.search(combined) or (
+          _FLASH_WORD_RE.search(combined)
+          and ("-low" in mid_low or "(low)" in lbl_low)
+      ):
+        variant_score = 3
+      elif "-low" in mid_low or "(low)" in lbl_low:
+        variant_score = 2
+      else:
+        variant_score = 1
+    elif tier == "flash":
+      if "-medium" in mid_low or "(medium)" in lbl_low:
+        variant_score = 4
+      elif not any(
+          tag in mid_low for tag in ("-low", "-high", "-xhigh", "-max")
+      ):
+        variant_score = 3
+      elif "-high" in mid_low or "(high)" in lbl_low:
+        variant_score = 2
+      else:
+        variant_score = 1
+    else:  # pro
+      if (
+          ("-high" in mid_low or "(high)" in lbl_low)
+          and "-xhigh" not in mid_low
+          and "(xhigh)" not in lbl_low
+      ):
+        variant_score = 5
+      elif (
+          "-xhigh" in mid_low
+          or "(xhigh)" in lbl_low
+          or "-max" in mid_low
+          or "(max)" in lbl_low
+      ):
+        variant_score = 4
+      elif not any(
+          tag in combined
+          for tag in ("orchestrator", "coordinator", "-low", "(low)", "-medium", "(medium)")
+      ):
+        variant_score = 3
+      elif (
+          "-medium" in mid_low
+          or "(medium)" in lbl_low
+          or "orchestrator" in combined
+          or "coordinator" in combined
+      ):
+        variant_score = 2
+      else:
+        variant_score = 1
+
+    score = (
+        1 if is_discovered else 0,
+        1 if provider == "google" else 0,
+        1 if mid_low.startswith("gemini-") else 0,
+        ver_major,
+        ver_minor,
+        variant_score,
+        1 if str(entry.get("enum") or "").strip() else 0,
+    )
+    prev = best_by_tier.get(tier)
+    if prev is None or score > prev[0]:
+      best_by_tier[tier] = (score, mid)
+
+  return {
+      tier: (
+          best_by_tier[tier][1]
+          if tier in best_by_tier
+          else DEFAULT_TIER_MODELS[tier]
+      )
+      for tier in ("flash_lite", "flash", "pro")
+  }
+
+
 def list_available_target_models(
     *,
     tier_models: Mapping[str, str] | None = None,
     custom_model_enums: Mapping[str, str] | None = None,
     environ: Mapping[str, str] | None = None,
+    discovered_models: Sequence[Mapping[str, Any]] | None = None,
+    discovered_cache_path: str | os.PathLike[str] | None = None,
+    refresh_discovered: bool = False,
 ) -> dict[str, Any]:
-  """Returns all catalog and custom target models plus active tier assignments."""
+  """Returns built-in, discovered, and custom target models plus tier mappings."""
   active = resolve_tier_models(tier_models, environ=environ)
   assigned_by_model: dict[str, list[str]] = {}
   for tier, model_id in active.items():
     assigned_by_model.setdefault(model_id, []).append(tier)
 
+  if discovered_models is not None:
+    raw_discovered: list[Mapping[str, Any]] = [
+        m for m in discovered_models if isinstance(m, Mapping)
+    ]
+  elif (
+      environ is not None
+      and discovered_cache_path is None
+      and not refresh_discovered
+  ):
+    raw_discovered = []
+  else:
+    raw_discovered = discover_installed_models(
+        cache_path=discovered_cache_path,
+        force_refresh=refresh_discovered,
+        run_cli_fallback=refresh_discovered,
+    )
+
   models: list[dict[str, Any]] = []
-  seen_ids: set[str] = set()
+  index_by_id: dict[str, int] = {}
   for entry in AVAILABLE_TARGET_MODELS:
     mid = str(entry["id"])
-    seen_ids.add(mid)
     item = dict(entry)
     item["assigned_tiers"] = assigned_by_model.get(mid, [])
     item["custom"] = False
+    item["source"] = "builtin"
+    index_by_id[mid] = len(models)
     models.append(item)
+
+  discovered_ids: set[str] = set()
+  for disc_raw in raw_discovered:
+    norm = _normalize_cached_model_entry(disc_raw)
+    if norm is None:
+      continue
+    mid = norm["id"]
+    discovered_ids.add(mid)
+    if mid in index_by_id:
+      existing = models[index_by_id[mid]]
+      if norm["enum"] and not existing.get("enum"):
+        existing["enum"] = norm["enum"]
+      elif norm["enum"] and existing.get("source") != "builtin":
+        existing["enum"] = norm["enum"]
+      curr_label = str(existing.get("label") or "").strip()
+      new_label = norm["label"]
+      if new_label and new_label != mid and (
+          not curr_label or curr_label == mid or len(new_label) > len(curr_label)
+      ):
+        existing["label"] = new_label
+    else:
+      item = dict(norm)
+      item["assigned_tiers"] = assigned_by_model.get(mid, [])
+      item["custom"] = False
+      index_by_id[mid] = len(models)
+      models.append(item)
 
   if isinstance(custom_model_enums, Mapping):
     for mid_raw, enum_raw in custom_model_enums.items():
       mid = str(mid_raw or "").strip()
       enum_val = str(enum_raw or "").strip()
-      if not mid or mid in seen_ids:
+      if not mid:
         continue
-      seen_ids.add(mid)
+      if mid in index_by_id:
+        if enum_val:
+          models[index_by_id[mid]]["enum"] = enum_val
+        continue
+      inf_tier, inf_think = infer_model_tier_and_thinking(mid, mid)
+      index_by_id[mid] = len(models)
       models.append({
           "id": mid,
           "label": mid,
           "provider": "custom",
-          "tier": (assigned_by_model.get(mid) or ["custom"])[0],
+          "tier": (assigned_by_model.get(mid) or [inf_tier])[0],
           "enum": enum_val,
-          "default_thinking_level": 2,
+          "default_thinking_level": inf_think,
           "description": "User-configured custom target model.",
           "assigned_tiers": assigned_by_model.get(mid, []),
           "custom": True,
+          "source": "custom",
       })
 
   for tier, mid in active.items():
-    if mid not in seen_ids:
-      seen_ids.add(mid)
+    if mid not in index_by_id:
+      index_by_id[mid] = len(models)
       models.append({
           "id": mid,
           "label": mid,
@@ -1735,6 +2463,7 @@ def list_available_target_models(
           "description": "User-configured target model override.",
           "assigned_tiers": assigned_by_model.get(mid, []),
           "custom": True,
+          "source": "custom",
       })
 
   env = os.environ if environ is None else environ
@@ -1743,9 +2472,12 @@ def list_available_target_models(
       for tier, env_key in TIER_ENV_VARS.items()
       if str(env.get(env_key) or "").strip()
   }
+  suggested = suggest_tier_models(models)
   return {
       "active_tier_models": active,
       "default_tier_models": dict(DEFAULT_TIER_MODELS),
+      "suggested_tier_models": suggested,
+      "discovered_count": len(discovered_ids),
       "env_overrides": env_overrides,
       "available_target_models": models,
   }
@@ -1788,8 +2520,8 @@ _EXPLICIT_MODEL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "flash_lite",
     ),
     (re.compile(r"\buse\s+(?:gemini[-\s]*)?flash\b", re.I), "flash"),
-    (re.compile(r"\buse\s+(?:gemini[-\s]*)?pro\b", re.I), "pro"),
-    (re.compile(r"\buse\s+claude\b", re.I), "pro"),
+    (re.compile(r"\b(?:use|run)\s+(?:gemini[-\s]*)?pro\b", re.I), "pro"),
+    (re.compile(r"\b(?:use|run)\s+(?:claude|opus)\b", re.I), "pro"),
 )
 
 _ROUTER_QUESTIONS: dict[str, Any] = {
