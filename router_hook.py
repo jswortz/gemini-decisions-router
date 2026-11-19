@@ -255,9 +255,17 @@ def _load_discovered_models_for_enums() -> list[dict[str, Any]]:
   return []
 
 
+_THINKING_VARIANT_SUFFIX_RE = re.compile(
+    r"-(?:low|medium|high|xhigh|max)$", re.IGNORECASE
+)
+_LS_MAX_RESPONSE_BYTES = 33_554_432  # 32 MiB cap (Turn 1 trajectories exceed 600 KiB)
+_last_owned_ls_endpoint: dict[str, tuple[str, str]] = {}
+
+
 def resolve_model_enums(cfg: dict[str, Any] | None = None) -> dict[str, str]:
   enums = dict(MODEL_ENUMS)
-  for entry in _load_discovered_models_for_enums():
+  discovered_entries = _load_discovered_models_for_enums()
+  for entry in discovered_entries:
     mid = str(entry.get("id") or "").strip()
     enum_val = str(entry.get("enum") or "").strip()
     if mid and enum_val and _SAFE_ENUM_RE.fullmatch(enum_val):
@@ -266,6 +274,27 @@ def resolve_model_enums(cfg: dict[str, Any] | None = None) -> dict[str, str]:
     for mid, enum_val in cfg["custom_model_enums"].items():
       if str(mid).strip() and _SAFE_ENUM_RE.fullmatch(str(enum_val).strip()):
         enums[str(mid).strip()] = str(enum_val).strip()
+
+  # Propagate base MODEL_* enums across -low/-medium/-high/-xhigh/-max siblings.
+  base_enums: dict[str, str] = {}
+  for mid, enum_val in list(enums.items()):
+    if not _SAFE_ENUM_RE.fullmatch(enum_val):
+      continue
+    base_id = _THINKING_VARIANT_SUFFIX_RE.sub("", mid)
+    if mid == base_id or base_id not in base_enums:
+      base_enums[base_id] = enum_val
+
+  for entry in discovered_entries:
+    mid = str(entry.get("id") or "").strip()
+    if mid and mid not in enums:
+      base_id = _THINKING_VARIANT_SUFFIX_RE.sub("", mid)
+      if base_id in base_enums:
+        enums[mid] = base_enums[base_id]
+
+  for base_id, base_enum in base_enums.items():
+    for suffix in ("low", "medium", "high", "xhigh", "max"):
+      enums.setdefault(f"{base_id}-{suffix}", base_enum)
+
   return enums
 
 
@@ -339,32 +368,60 @@ def _log_redispatch_error(message: str) -> None:
     pass
 
 
-def _discover_ls_endpoint() -> tuple[str, str]:
+_LOCAL_LS_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _fetch_ls_html_csrf(candidate: str, timeout: float = 0.35) -> str:
+  try:
+    req = urllib.request.Request(f"http://{candidate}/")
+    with _LOCAL_LS_OPENER.open(req, timeout=timeout) as resp:
+      html = resp.read(65536).decode("utf-8", "replace")
+    m = re.search(r'["\']csrfToken["\']\s*:\s*["\']([^"\']+)["\']', html)
+    return m.group(1) if m else ""
+  except OSError:
+    return ""
+
+
+def _discover_ls_endpoints() -> list[tuple[str, str]]:
+  """Discovers all local `(addr, csrf)` Language Server endpoints."""
   addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip()
   csrf = (
       os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "").strip()
       or os.environ.get("ANTIGRAVITY_SERVER_CSRF_TOKEN", "").strip()
   )
-  if addr and csrf:
-    return addr, csrf
-  for port in (5387,):
-    candidate = f"127.0.0.1:{port}"
-    try:
-      req = urllib.request.Request(f"http://{candidate}/")
-      with urllib.request.urlopen(req, timeout=0.4) as resp:
-        html = resp.read(65536).decode("utf-8", "replace")
-      m = re.search(r'["\']csrfToken["\']\s*:\s*["\']([^"\']+)["\']', html)
-      if m:
-        return candidate, m.group(1)
-    except OSError:
+  if addr:
+    tok = csrf or _fetch_ls_html_csrf(addr)
+    return [(addr, tok)] if tok else []
+
+  cand_fn = getattr(decisions_engine, "discover_local_ls_candidates", None)
+  raw_candidates: list[tuple[str, str]] = (
+      cand_fn() if callable(cand_fn) else [("127.0.0.1:5387", csrf)]
+  )
+  resolved: list[tuple[str, str]] = []
+  seen: set[str] = set()
+  for cand_addr, cand_csrf in raw_candidates:
+    if not cand_addr or cand_addr in seen:
       continue
-  return "", ""
+    tok = (cand_csrf or csrf or "").strip() or _fetch_ls_html_csrf(cand_addr)
+    if tok:
+      seen.add(cand_addr)
+      resolved.append((cand_addr, tok))
+  return resolved
+
+
+def _discover_ls_endpoint() -> tuple[str, str]:
+  endpoints = _discover_ls_endpoints()
+  return endpoints[0] if endpoints else ("", "")
 
 
 def _ls_rpc(
-    method: str, payload: dict[str, Any], timeout: float = 0.8
+    method: str,
+    payload: dict[str, Any],
+    timeout: float = 0.8,
+    *,
+    endpoint: tuple[str, str] | None = None,
 ) -> dict[str, Any] | None:
-  addr, csrf = _discover_ls_endpoint()
+  addr, csrf = endpoint if endpoint is not None else _discover_ls_endpoint()
   if not addr or not csrf:
     return None
   url = f"http://{addr}/exa.language_server_pb.LanguageServerService/{method}"
@@ -379,24 +436,48 @@ def _ls_rpc(
       method="POST",
   )
   try:
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-      return json.loads(resp.read(262144).decode("utf-8"))
+    with _LOCAL_LS_OPENER.open(req, timeout=timeout) as resp:
+      return json.loads(resp.read(_LS_MAX_RESPONSE_BYTES).decode("utf-8"))
   except (OSError, ValueError):
     return None
 
 
+_DEFAULT_LS_RPC = _ls_rpc
+
+
+def _is_owned_trajectory_resp(resp: Any) -> bool:
+  return (
+      isinstance(resp, dict)
+      and "error" not in resp
+      and ("trajectory" in resp or "status" in resp)
+  )
+
+
 def _verify_cascade_ownership(conversation_id: str) -> bool:
-  """Verifies the discovered Language Server owns `conversation_id`."""
+  """Verifies a discovered Language Server owns `conversation_id`."""
   if not conversation_id:
     return False
-  resp = _ls_rpc(
-      "GetCascadeTrajectory", {"cascadeId": conversation_id}, timeout=0.4
-  )
-  if not isinstance(resp, dict):
-    return False
-  if "error" in resp:
-    return False
-  return "trajectory" in resp or "status" in resp
+  _last_owned_ls_endpoint.pop(conversation_id, None)
+
+  # Preserve direct compatibility when unit tests monkeypatch `_ls_rpc`.
+  if _ls_rpc is not _DEFAULT_LS_RPC:
+    resp = _ls_rpc(
+        "GetCascadeTrajectory", {"cascadeId": conversation_id}, timeout=0.4
+    )
+    return _is_owned_trajectory_resp(resp)
+
+  endpoints = _discover_ls_endpoints()
+  for ep in endpoints:
+    resp = _ls_rpc(
+        "GetCascadeTrajectory",
+        {"cascadeId": conversation_id},
+        timeout=0.5,
+        endpoint=ep,
+    )
+    if _is_owned_trajectory_resp(resp):
+      _last_owned_ls_endpoint[conversation_id] = ep
+      return True
+  return False
 
 
 def _spawn_redispatch(
@@ -406,7 +487,9 @@ def _spawn_redispatch(
     *,
     allowed_enums: set[str] | None = None,
 ) -> bool:
-  addr, csrf = _discover_ls_endpoint()
+  addr, csrf = _last_owned_ls_endpoint.get(
+      conversation_id
+  ) or _discover_ls_endpoint()
   if not addr or not csrf or not conversation_id or not model_enum:
     return False
   valid_enums = allowed_enums or set(MODEL_ENUMS.values())

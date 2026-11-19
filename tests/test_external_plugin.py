@@ -1867,6 +1867,7 @@ def test_benchmark_suite_dataset_mock_runner_and_live_results(
 def test_docs_contain_no_em_or_en_dashes() -> None:
   doc_paths = [
       REPO_ROOT / "README.md",
+      REPO_ROOT / "rules" / "AGENTS.md",
       REPO_ROOT / "docs" / "BENCHMARKS.md",
       REPO_ROOT / "docs" / "CUSTOMER_ONBOARDING.md",
       REPO_ROOT / "docs" / "AUTHENTICATION_ADC.md",
@@ -1878,6 +1879,145 @@ def test_docs_contain_no_em_or_en_dashes() -> None:
     text = doc.read_text(encoding="utf-8")
     assert "\u2014" not in text, f"Em-dash found in {doc}"
     assert "\u2013" not in text, f"En-dash found in {doc}"
+
+
+def test_head_to_head_flash_lite_benchmark_and_streaming_stdout(
+    tmp_path: pathlib.Path,
+) -> None:
+  """Verifies N=100 flash-lite head-to-head runner, live JSON schema, and stdout streaming."""
+  dataset_path = REPO_ROOT / "benchmarks" / "prompts_100.json"
+  h2h_runner = REPO_ROOT / "benchmarks" / "run_router_head_to_head.py"
+  h2h_results = REPO_ROOT / "benchmarks" / "results_flash_lite_router_100.json"
+  bench_runner = REPO_ROOT / "benchmarks" / "run_benchmark.py"
+
+  assert h2h_runner.is_file()
+  assert h2h_results.is_file()
+
+  # 1. Default --mock streams per-prompt [001/100] lines + ROUTED WITH INTENT summary box
+  mock_h2h_out = tmp_path / "mock_h2h.json"
+  proc_h2h = subprocess.run(
+      [
+          sys.executable,
+          "-B",
+          str(h2h_runner),
+          "--dataset",
+          str(dataset_path),
+          "--output",
+          str(mock_h2h_out),
+          "--mock",
+      ],
+      capture_output=True,
+      text=True,
+      timeout=12.0,
+      check=True,
+  )
+  assert "[001/100]" in proc_h2h.stdout
+  assert "[100/100]" in proc_h2h.stdout
+  assert "ROUTED WITH INTENT | BENCHMARK ROUTING STATS" in proc_h2h.stdout
+  assert "[head-to-head:mock]" in proc_h2h.stdout
+
+  mock_h2h_json = json.loads(mock_h2h_out.read_text(encoding="utf-8"))
+  assert mock_h2h_json["metadata"]["mode"] == "mock"
+  assert mock_h2h_json["metadata"]["dataset_size"] == 100
+  assert (
+      mock_h2h_json["strategies"]["decisions_router_full"]["tokens"][
+          "total_output_tokens"
+      ]
+      == 0
+  )
+  assert (
+      mock_h2h_json["strategies"]["flash_lite_json_router"]["tokens"][
+          "total_output_tokens"
+      ]
+      > 0
+  )
+
+  # 2. --quiet suppresses per-prompt lines while preserving summary stats box on both runners
+  mock_h2h_quiet = tmp_path / "mock_h2h_quiet.json"
+  proc_h2h_q = subprocess.run(
+      [
+          sys.executable,
+          "-B",
+          str(h2h_runner),
+          "--dataset",
+          str(dataset_path),
+          "--output",
+          str(mock_h2h_quiet),
+          "--mock",
+          "--quiet",
+      ],
+      capture_output=True,
+      text=True,
+      timeout=12.0,
+      check=True,
+  )
+  assert "[001/100]" not in proc_h2h_q.stdout
+  assert "ROUTED WITH INTENT | BENCHMARK ROUTING STATS" in proc_h2h_q.stdout
+
+  mock_bench_quiet = tmp_path / "mock_bench_quiet.json"
+  proc_bench_q = subprocess.run(
+      [
+          sys.executable,
+          "-B",
+          str(bench_runner),
+          "--dataset",
+          str(dataset_path),
+          "--output",
+          str(mock_bench_quiet),
+          "--mock",
+          "--quiet",
+      ],
+      capture_output=True,
+      text=True,
+      timeout=12.0,
+      check=True,
+  )
+  assert "[001/100]" not in proc_bench_q.stdout
+  assert "ROUTED WITH INTENT | BENCHMARK ROUTING STATS" in proc_bench_q.stdout
+
+  # 3. Validate live results_flash_lite_router_100.json schema, invariants, and hygiene
+  raw_live_h2h = h2h_results.read_text(encoding="utf-8")
+  assert ("AIza" + "Sy") not in raw_live_h2h
+  assert ("ya" + "29.") not in raw_live_h2h
+  live_h2h = json.loads(raw_live_h2h)
+  assert live_h2h["metadata"]["mode"] == "live"
+  assert live_h2h["metadata"]["dataset_size"] == 100
+  assert live_h2h["metadata"]["flash_lite_router_model"] == (
+      "gemini-3.1-flash-lite-preview"
+  )
+  assert live_h2h["metadata"]["flash_router_model"] == "gemini-2.5-flash"
+
+  strats = live_h2h["strategies"]
+  for key in (
+      "decisions_router_full",
+      "decisions_tier1_only",
+      "flash_lite_json_router",
+      "flash_json_router",
+  ):
+    assert key in strats
+    assert strats[key]["sample_size"] == 100
+    assert strats[key]["latency"]["count"] == 100
+
+  assert strats["decisions_router_full"]["tokens"]["total_output_tokens"] == 0
+  assert strats["decisions_tier1_only"]["tokens"]["total_output_tokens"] == 0
+  assert strats["flash_lite_json_router"]["tokens"]["total_output_tokens"] > 0
+  assert strats["flash_json_router"]["tokens"]["total_output_tokens"] > 0
+  assert (
+      strats["decisions_router_full"]["accuracy"]["pro_miss_rate_pct"] == 0.0
+  )
+  assert (
+      strats["flash_lite_json_router"]["accuracy"]["pro_miss_rate_pct"] == 10.0
+  )
+  assert (
+      strats["decisions_tier1_only"]["latency"]["p50_ms"]
+      < strats["flash_lite_json_router"]["latency"]["p50_ms"]
+  )
+  assert (
+      strats["decisions_router_full"]["calibration"]["populated_bins_4"] == 4
+  )
+  assert (
+      strats["flash_lite_json_router"]["calibration"]["populated_bins_4"] == 1
+  )
 
 
 def test_smart_thread_floor_quick_lookup_unlock_and_config(
@@ -2162,3 +2302,192 @@ def test_watch_and_stats_action_and_reason_labels() -> None:
   assert "SWITCH" in stats_txt
   assert "reason=thread_lock" in stats_txt
   assert "reason=gemini_api" in stats_txt
+
+
+def test_large_trajectory_ls_rpc_sibling_enum_propagation_and_proc_discovery(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Verifies >600 KiB _ls_rpc reads, sibling enum backfill, and /proc LS discovery."""
+  # 1. >600 KiB GetCascadeTrajectory payload parses cleanly (no 256 KiB truncation)
+  big_padding = "x" * 750_000  # ~750 KiB > old 262,144-byte limit
+
+  class _LargeTrajectoryLsHandler(http.server.BaseHTTPRequestHandler):
+    owned_cascade = "owned-big-cascade-1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+      del fmt, args
+
+    def do_POST(self) -> None:  # pylint: disable=invalid-name
+      length = int(self.headers.get("Content-Length", "0"))
+      req_body = json.loads(self.rfile.read(length).decode("utf-8"))
+      if self.headers.get("x-codeium-csrf-token") != "mock-big-csrf":
+        self.send_response(403)
+        self.end_headers()
+        return
+      if req_body.get("cascadeId") != self.owned_cascade:
+        payload: dict[str, Any] = {"error": "cascade_not_found"}
+      else:
+        payload = {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "trajectory": {"skillsBlob": big_padding},
+        }
+      raw = json.dumps(payload).encode("utf-8")
+      self.send_response(200)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", str(len(raw)))
+      self.end_headers()
+      self.wfile.write(raw)
+
+  server1 = http.server.HTTPServer(("127.0.0.1", 0), _LargeTrajectoryLsHandler)
+  server1_port = server1.server_port
+  t1 = threading.Thread(target=server1.serve_forever, daemon=True)
+  t1.start()
+
+  class _SecondHubLsHandler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+      del fmt, args
+
+    def do_POST(self) -> None:  # pylint: disable=invalid-name
+      length = int(self.headers.get("Content-Length", "0"))
+      req_body = json.loads(self.rfile.read(length).decode("utf-8"))
+      if (
+          self.headers.get("x-codeium-csrf-token") == "mock-hub2-csrf"
+          and req_body.get("cascadeId") == "owned-by-second-hub"
+      ):
+        payload: dict[str, Any] = {
+            "status": "CASCADE_RUN_STATUS_RUNNING",
+            "trajectory": {"skillsBlob": big_padding},
+        }
+      else:
+        payload = {"error": "cascade_not_found"}
+      raw = json.dumps(payload).encode("utf-8")
+      self.send_response(200)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", str(len(raw)))
+      self.end_headers()
+      self.wfile.write(raw)
+
+  server2 = http.server.HTTPServer(("127.0.0.1", 0), _SecondHubLsHandler)
+  server2_port = server2.server_port
+  t2 = threading.Thread(target=server2.serve_forever, daemon=True)
+  t2.start()
+
+  try:
+    monkeypatch.setenv("ANTIGRAVITY_LS_ADDRESS", f"127.0.0.1:{server1_port}")
+    monkeypatch.setenv("ANTIGRAVITY_CSRF_TOKEN", "mock-big-csrf")
+
+    rpc_res = router_hook._ls_rpc(
+        "GetCascadeTrajectory",
+        {"cascadeId": "owned-big-cascade-1"},
+        timeout=2.0,
+    )
+    assert isinstance(rpc_res, dict)
+    assert rpc_res["status"] == "CASCADE_RUN_STATUS_IDLE"
+    assert len(rpc_res["trajectory"]["skillsBlob"]) == 750_000
+    assert router_hook._verify_cascade_ownership("owned-big-cascade-1") is True
+    assert router_hook._verify_cascade_ownership("unowned-cascade-99") is False
+
+    # 2. Multi-endpoint /proc ephemeral LS discovery selects the second Hub port
+    monkeypatch.delenv("ANTIGRAVITY_LS_ADDRESS", raising=False)
+    monkeypatch.delenv("ANTIGRAVITY_CSRF_TOKEN", raising=False)
+    fake_proc = tmp_path / "fake_proc"
+    (fake_proc / "net").mkdir(parents=True)
+    port1_hex = f"{server1_port:04X}"
+    port2_hex = f"{server2_port:04X}"
+    (fake_proc / "net" / "tcp").write_text(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when"
+        " retrnsmt   uid  timeout inode\n"
+        f"   0: 0100007F:{port1_hex} 00000000:0000 0A 00000000:00000000 00:00000000"
+        f" 00000000  {os.getuid()}        0 11111 1 0000000000000000 100 0 0 10 0\n"
+        f"   1: 0100007F:{port2_hex} 00000000:0000 0A 00000000:00000000 00:00000000"
+        f" 00000000  {os.getuid()}        0 22222 1 0000000000000000 100 0 0 10 0\n",
+        encoding="utf-8",
+    )
+    for pid_str, hub_port, csrf_val, sock_ino in (
+        ("900001", server1_port, "mock-big-csrf", "11111"),
+        ("900002", server2_port, "mock-hub2-csrf", "22222"),
+    ):
+      pdir = fake_proc / pid_str
+      (pdir / "fd").mkdir(parents=True)
+      (pdir / "cmdline").write_bytes(
+          f"/opt/bin/agy\x00--hub\x00--hub-port={hub_port}\x00--csrf_token={csrf_val}\x00".encode(
+              "utf-8"
+          )
+      )
+      (pdir / "environ").write_bytes(b"PATH=/usr/bin\x00")
+      (pdir / "status").write_text("PPid:\t1\n", encoding="utf-8")
+      (pdir / "fd" / "3").symlink_to(f"socket:[{sock_ino}]")
+
+    cands = decisions_engine.discover_local_ls_candidates(proc_root=fake_proc)
+    assert (f"127.0.0.1:{server1_port}", "mock-big-csrf") in cands
+    assert (f"127.0.0.1:{server2_port}", "mock-hub2-csrf") in cands
+
+    monkeypatch.setattr(
+        decisions_engine,
+        "discover_local_ls_candidates",
+        lambda: cands[:2],
+    )
+    assert router_hook._verify_cascade_ownership("owned-by-second-hub") is True
+    assert router_hook._last_owned_ls_endpoint["owned-by-second-hub"] == (
+        f"127.0.0.1:{server2_port}",
+        "mock-hub2-csrf",
+    )
+  finally:
+    server1.shutdown()
+    server1.server_close()
+    server2.shutdown()
+    server2.server_close()
+
+  # 3. Sibling -low/-medium/-high/-xhigh/-max MODEL_* enum propagation
+  raw_siblings = [
+      {
+          "id": "gemini-5.0-flash-low",
+          "label": "Gemini 5.0 Flash (Low)",
+          "tier": "flash_lite",
+          "enum": "MODEL_PLACEHOLDER_M999",
+          "default_thinking_level": 1,
+          "source": "discovered_ls",
+      },
+      {
+          "id": "gemini-5.0-flash-medium",
+          "label": "Gemini 5.0 Flash (Medium)",
+          "tier": "flash",
+          "enum": "",
+          "default_thinking_level": 2,
+          "source": "discovered_cli",
+      },
+      {
+          "id": "gemini-5.0-flash-high",
+          "label": "Gemini 5.0 Flash (High)",
+          "tier": "flash",
+          "enum": "",
+          "default_thinking_level": 3,
+          "source": "discovered_cli",
+      },
+  ]
+  propagated = decisions_engine.propagate_sibling_model_enums(raw_siblings)
+  by_id = {m["id"]: m["enum"] for m in propagated}
+  assert by_id["gemini-5.0-flash-low"] == "MODEL_PLACEHOLDER_M999"
+  assert by_id["gemini-5.0-flash-medium"] == "MODEL_PLACEHOLDER_M999"
+  assert by_id["gemini-5.0-flash-high"] == "MODEL_PLACEHOLDER_M999"
+
+  # Built-in explicit distinct enums (gemini-3.1-pro-low vs gemini-3.1-pro-high) are never overwritten
+  catalog = decisions_engine.list_available_target_models(
+      discovered_models=raw_siblings, environ={}
+  )
+  cat_enums = {m["id"]: m["enum"] for m in catalog["available_target_models"]}
+  assert cat_enums["gemini-5.0-flash-medium"] == "MODEL_PLACEHOLDER_M999"
+  assert cat_enums["gemini-5.0-flash-high"] == "MODEL_PLACEHOLDER_M999"
+  assert cat_enums["gemini-3.1-pro-low"] == "MODEL_GOOGLE_GEMINI_3_1_PRO_LOW"
+  assert cat_enums["gemini-3.1-pro-high"] == "MODEL_GOOGLE_GEMINI_3_1_PRO"
+
+  monkeypatch.setattr(
+      router_hook, "_load_discovered_models_for_enums", lambda: raw_siblings
+  )
+  resolved = router_hook.resolve_model_enums({})
+  assert resolved["gemini-5.0-flash-low"] == "MODEL_PLACEHOLDER_M999"
+  assert resolved["gemini-5.0-flash-medium"] == "MODEL_PLACEHOLDER_M999"
+  assert resolved["gemini-5.0-flash-high"] == "MODEL_PLACEHOLDER_M999"
+  assert resolved["gemini-5.0-flash-xhigh"] == "MODEL_PLACEHOLDER_M999"
+  assert resolved["gemini-5.0-flash-max"] == "MODEL_PLACEHOLDER_M999"

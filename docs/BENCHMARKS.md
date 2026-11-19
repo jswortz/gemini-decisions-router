@@ -58,16 +58,26 @@ Overall ground-truth tier distribution across the 100 prompts: **`25` `flash_lit
 ## Reproducibility Commands
 
 ```bash
-# 1. Run deterministic offline mock benchmark (<0.1s, zero network calls, CI-safe)
+# 1. Run deterministic offline mock benchmark (<0.1s, zero network calls, streams live stdout stats)
 python3 benchmarks/run_benchmark.py --mock --output /tmp/mock_bench.json
 
-# 2. Run full live 100-prompt + 15-prompt E2E benchmark (uses ~/.config/gemini-decisions-router/.env or ADC)
+# 2. Run deterministic offline N=100 flash-lite & flash JSON head-to-head (--quiet for summary box only)
+python3 benchmarks/run_router_head_to_head.py --mock --output /tmp/mock_h2h.json
+python3 benchmarks/run_router_head_to_head.py --mock --quiet --output /tmp/mock_h2h.json
+
+# 3. Run full live 100-prompt + 15-prompt E2E benchmark (uses ~/.config/gemini-decisions-router/.env or ADC)
 python3 benchmarks/run_benchmark.py \
   --dataset benchmarks/prompts_100.json \
   --output benchmarks/results_100.json \
   --concurrency 1
 
-# 3. Render the 1600x1040 4-panel dark-theme dashboard PNG
+# 4. Run full live N=100 flash-lite & flash JSON router head-to-head benchmark
+python3 benchmarks/run_router_head_to_head.py \
+  --dataset benchmarks/prompts_100.json \
+  --output benchmarks/results_flash_lite_router_100.json \
+  --concurrency 1
+
+# 5. Render the 1600x1040 4-panel dark-theme dashboard PNG
 python3 benchmarks/render_charts.py \
   --input benchmarks/results_100.json \
   --output assets/benchmark-dashboard.png
@@ -153,3 +163,43 @@ Notice the directional safety property: across every bin, empirical accuracy **e
 | **100-Prompt Workload: Always-Pro** | `0.00 s` | `473.21 s` | `473.21 s` | `0.0%` | `$0.0000` | `$0.5154` | `$0.5154` | `0.0%` |
 | **100-Prompt Workload: `GenerateContent`-Routed** | `115.16 s` | `300.86 s` | `416.02 s` | `-12.1%` | `$0.0417` | `$0.2159` | `$0.2576` | `-50.0%` |
 | **100-Prompt Workload: Gemini Decisions Router** | **`29.50 s`** | `306.03 s` | **`335.53 s`** | **`-29.1%`** | **`$0.0046`** | `$0.2205` | **`$0.2251`** | **`-56.3%`** |
+
+---
+
+### 5. `N=100` Head-to-Head Study: `gemini-decision-1` vs `flash-lite` & `flash` JSON Routers
+
+A common engineering question is: *"What if we disable thinking (`thinkingBudget: 0`), enforce `responseMimeType: "application/json"`, and use `gemini-3.1-flash-lite-preview` or `gemini-2.5-flash` as a lightweight structured-output router across all 100 prompts?"*
+
+We executed that exact 100-prompt head-to-head live in `benchmarks/run_router_head_to_head.py` (`benchmarks/results_flash_lite_router_100.json`, sequential `concurrency=1`, `0` HTTP retries):
+
+| Head-to-Head Metric (`N=100`) | Gemini Decisions Router (Tier 0+1) | Pure `gemini-decision-1` (Tier 1) | `flash-lite` JSON Router (`gemini-3.1-flash-lite-preview`, `thinkingBudget=0`) | `flash` JSON Router (`gemini-2.5-flash`, `thinkingBudget=0`) | `flash` JSON Router (`gemini-2.5-flash`, default thinking, `N=15`) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Router Latency `p50`** | **`278.2 ms`** | **`235.3 ms`** | `709.4 ms` (**`2.55x-3.01x` slower**) | `480.0 ms` (`1.73x-2.04x` slower) | `1,124.3 ms` (`4.04x-4.78x` slower) |
+| **Router Latency `p90` / `p99`** | `411.4 ms` / `1,146.2 ms` | **`374.2 ms` / `407.2 ms`** | `868.9 ms` / `1,014.2 ms` | `552.1 ms` / `606.2 ms` | `1,643.8 ms` / `2,112.3 ms` |
+| **Mean In / Out Tokens** | `459.1` / **`0.0`** | `513.1` / **`0.0`** | `228.1` / `20.7` (`0` thought) | `228.1` / `24.1` (`0` thought) | `186.9` / `144.3` (`128.9` thought) |
+| **Exact 3-Tier Accuracy** | **`96.0%`** (`96/100`) | **`96.0%`** (`96/100`) | `93.0%` (`93/100`) | `93.0%` (`93/100`) | `100.0%` (`15/15` single-turn) |
+| **Critical Pro-Miss Rate** | **`0.0%`** (`0/30`) | **`0.0%`** (`0/30`) | **`10.0%`** (`3/30` missed) | **`10.0%`** (`3/30` missed) | `0.0%` (`0/5` single-turn) |
+| **Non-Pro Over-Routed to Pro** | **`0.0%`** (`0/70`) | **`0.0%`** (`0/70`) | `5.7%` (`4/70`) | `5.7%` (`4/70`) | `0.0%` (`0/10`) |
+| **Confidence Bins Populated (`4` bins)** | **`4 / 4`** (`0.66 -> 0.94`) | **`4 / 4`** (`0.64 -> 0.94`) | **`1 / 4`** (`100/100` in `[0.90, 1.00]`) | **`1 / 4`** (`100/100` in `[0.90, 1.00]`) | `0 / 4` (no probabilities) |
+| **Mean Confidence When Wrong** | `0.814` (`Brier = 0.0524`) | `0.814` (`Brier = 0.0583`) | **`0.943`** (`7/7` errors `>= 0.85`, `Brier = 0.0634`) | **`0.900`** (`7/7` errors `>= 0.85`, `Brier = 0.0633`) | N/A |
+| **Router Cost / 100 Prompts** | **`$0.00459`** | **`$0.00513`** | `$0.00881` (`$0.25/$1.50` preview rates; `$0.00311` at `$0.10/$0.40`) | `$0.01288` (`2.80x` higher) | `$0.04168` (`9.08x` higher) |
+| **Projected 100-Prompt E2E Time** | **`335.53 s` (`-29.1%`)** | **`331.27 s` (`-30.0%`)** | `372.84 s` (`-21.2%`, `+37.3 s` slower) | `346.81 s` (`-26.7%`) | `416.02 s` (`-12.1%`) |
+
+**Why Single-Pass Prefill Outperforms `flash-lite` Structured JSON Routing:**
+1. **`2.55x` to `3.01x` Faster `p50` Latency:** Even with `thinkingBudget: 0` and `temperature: 0.0`, `gemini-3.1-flash-lite-preview` still had to autoregressively decode `20.7` JSON tokens per call (`709.4 ms` `p50`, `1,014.2 ms` `p99`), adding **`71.3 seconds`** of router overhead per 100 prompts vs **`25.3s` to `29.5s`** for `gemini-decision-1`.
+2. **Zero Frontier Drops vs `10.0%` Stateless Pro-Misses:** Both `flash-lite` and `flash` JSON routers dropped all 3 Turn 2+ `pro`-locked continuation prompts (`"yes go ahead"`, `"do step 2 next"`, `"sounds good, proceed"`) down to `flash_lite`/`flash` (`10.0%` Pro-Miss Rate) and over-routed `4/70` `flash` tasks up to `pro` (`5.7%` over-route rate).
+3. **Verbalized Overconfidence Defeats Confidence Gating:** Asking `flash-lite` or `flash` to emit `"confidence"` inside JSON collapsed **100 out of 100 prompts into the `[0.90, 1.00]` bin** (`stdev = 0.023`), assigning **`0.943` mean confidence when wrong** (`100%` of errors had `confidence >= 0.85`). By contrast, `gemini-decision-1` derives confidence from single-pass prefill posteriors across `4/4` populated bins (`Brier = 0.0524`), enabling reliable `min_confidence` gating.
+
+---
+
+## 6. Comparison Against Leading LLM Routing Frameworks
+
+| Engineering Dimension | Gemini Decisions Router (`gemini-decision-1`, Tier 0+1) | RouteLLM (LMSYS `mf`, `sw_ranking`, `bert`, `causal_llm`) | Semantic Router (Aurelio AI) | Arch-Router-1.5B (ArchGW) & vLLM Semantic Router | LangGraph / LlamaIndex / PydanticAI (`flash-lite` / `flash` JSON) | Commercial Hosted Routers (NotDiamond, Martian, `openrouter/auto`) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Core Mechanism** | **Tier 0** local rules (`<0.1 ms`) + **Tier 1** 1-pass prefill over 3 rubric questions (`choice` + `noul` + `score`) | Pairwise `P(strong_wins)` via Matrix Factorization, Elo, `BERT`, or `Llama-3-8B` ([arXiv:2406.18665](https://arxiv.org/abs/2406.18665)) | Dense/sparse encoder + cosine similarity over static example `utterances` | **Arch-Router:** `1.5B` JSON decode ([arXiv:2506.16655](https://arxiv.org/abs/2506.16655)). **vLLM SR:** `ModernBERT` Envoy filter ([arXiv:2510.08731](https://arxiv.org/abs/2510.08731)) | Autoregressive `GenerateContent` constrained to Pydantic / JSON schema (`responseMimeType: "application/json"`) | **NotDiamond:** SaaS meta-classifier. **Martian:** Model Mapping proxy. **OpenRouter:** ~30-task market router |
+| **Router Output Tokens** | **`0` output tokens** (`0` thought tokens) | `0` (`mf`, `sw_ranking`, `bert`); `1` token (`causal_llm`) | **`0` output tokens** (vector embedding) | **Arch-Router:** `~8-15` JSON tokens. **vLLM SR:** `0` tokens | **`20.7` (`flash-lite`, `thinking=0`) to `144.3` (`flash` default)** | `0` client-visible tokens (server-side proxy) |
+| **Routing Latency (`p50` / `p99`)** | **`235-278 ms` `p50` / `407-1,146 ms` `p99`** (Tier 0 `<0.1 ms`) | `~6-24 ms` on dedicated L4 GPU + `~50-150 ms` OpenAI embed RTT (`~345 ms` CPU on `sw_ranking`) | `~5-15 ms` (local ONNX) or `~45-120 ms` (cloud embedding API) | **Arch-Router:** `~51 ms` GPU (`~250-600 ms` CPU). **vLLM SR:** `~5-20 ms` local Envoy filter | **`480-709 ms` `p50` / `606-1,014 ms` `p99`** (`thinking=0`); **`1,124 ms` `p50` / `2,112 ms` `p99`** (default thinking) | **NotDiamond:** `~100-150 ms` RTT. **Martian / OpenRouter:** `~20-80 ms` in-gateway |
+| **Zero-Shot Rubric Flexibility** | **High:** `1-64` arbitrary `noul`, `choice` (`<=255` options), and `score` questions in 1 call; zero retraining | **Low:** Binary strong/weak split trained on ~80k Arena pairs; new tiers/models require re-fitting | **Low-Medium:** Requires curating `10-50+` utterances per route; conflates topic similarity with reasoning depth | **Arch-Router:** Medium-High (domain/action JSON policies). **vLLM SR:** Low (requires `ModernBERT` fine-tuning) | **High:** Arbitrary JSON schema in prompt, but latency scales linearly with output fields | **Low:** Fixed `cost`/`quality`/`latency` sliders; custom routers require labeled eval sets |
+| **Calibration & Confidence Gating** | **Calibrated Posteriors:** `4/4` bins populated, `ECE = 0.103`, `Brier = 0.0524`, conservative under-confidence | Scalar pairwise win score (`P(strong_wins)`); uncalibrated across multi-rubric tiers | Uncalibrated cosine similarity (`[-1, 1]`); requires `RouteLayer.fit()` threshold sweeps | **Arch-Router:** Uncalibrated greedy JSON text. **vLLM SR:** Raw `ModernBERT` softmax logits | **Verbalized Overconfidence:** `100/100` collapsed in `[0.90, 1.00]`, `0.90-0.94` mean conf when wrong ([arXiv:2306.13063](https://arxiv.org/abs/2306.13063)) | **Opaque:** Proxy returns winning model ID without pre-dispatch rubric posteriors |
+| **Agentic Lifecycle Awareness** | **Native:** Smart Turn 2+ thread floor, `PreToolUse` `invoke_subagent` right-sizing, `agy models` + LS auto-discovery | **Stateless:** Downgrades Turn 2+ `"yes go ahead"` replies, busting KV caches and losing Pro context | **Stateless:** No conversation floor, subagent tool-hook interception, or model discovery | **Gateway-Only:** Inspects HTTP payloads in Envoy, but lacks IDE `PreToolUse` hooks or CLI discovery | **DIY:** Requires hand-coding thread state, subagent hooks, and JSON fallback guards in app code | **Session Stickiness Only:** Basic provider failover, no client hook or subagent awareness |
+| **Infra Footprint & Cost / `1,000` Routes** | **Pure Python 3.11+ stdlib (`0` pip pkgs, `0` GPUs)**; **`~$0.046` / 1k routes** | PyTorch + `3-16 GB` GPU (`~$500-$800/mo` L4 idle cost at dev QPS) + embedding API | `semantic-router` SDK + `100-500 MB` ONNX encoder (`$0` local or `~$0.01/1k` API) | Envoy + Docker/K8s + dedicated GPU/Rust daemon (`$150-$800/mo` cluster footprint) | Framework SDK + **`~$0.03-$0.09` / 1k** (`flash-lite`) up to **`~$0.42` / 1k** (`flash`) | Third-party SDK (`~$0.025-$1.00 / 1k` on NotDiamond) or external multi-tenant proxy egress |

@@ -11,8 +11,8 @@ Traditional LLM routers generate JSON text token-by-token, adding 400 to 1,500 m
 - **2-Tier Calibrated Prompt Routing (`PreInvocation`):**
   - **Tier 0 (`<1 ms`):** Instant local fast rules handle confirmations (`"ship it"`, `"lgtm"`), explicit model requests (`"use gemini pro"`), crash markers, Turn 2+ thread continuations, and multi-step tool-loop deduplication.
   - **Tier 1 (`~150-300 ms`, 0 output tokens, `1.5s` hook deadline):** Calls `gemini-decision-1` once to score task intent (`choice`), frontier reasoning need (`noul`), and thinking effort (`score`), routing across `flash_lite`, `flash`, and `pro` target models.
-- **Universal `"✦ Routed with Intent"` Visibility (0 Model Tokens):** Renders inline `metadata.user_markdown` routing banners in **both** the Antigravity Desktop App and `agy` CLI with `"systemMessage": ""` (zero prompt token overhead), alongside `PreToolUse` subagent notices, 4 verbosity presets (`silent`, `compact`, `normal`, `verbose`), live terminal streaming (`agy-router watch`), and historical summaries (`agy-router stats`).
-- **Asymmetric Thread Floor & Multi-Step Deduplication:** Prevents mid-conversation downgrades on Turn 2+ so short replies like `"yes go ahead"` never drop an active `pro` session down to `flash_lite`, and deduplicates multi-step tool loops so Steps 2..N execute in `<1 ms` with zero extra API calls or duplicate banners.
+- **Universal `"✦ Routed with Intent"` Visibility:** Renders zero-token `renderInfo` routing cards in the Antigravity Desktop App (`"systemMessage": ""`) and a 1-line `> ✦ **Routed with Intent**` inline badge in `agy` CLI (`cli_inline_banner: true`), alongside `PreToolUse` subagent notices, 4 verbosity presets (`silent`, `compact`, `normal`, `verbose`), live terminal streaming (`agy-router watch`), and historical summaries (`agy-router stats`).
+- **Smart Asymmetric Thread Floor & Multi-Step Deduplication:** Prevents mid-conversation downgrades on Turn 2+ coding, data, and architecture threads (`enable_thread_floor: true`) so short replies like `"yes go ahead"` never drop an active `pro` session down to `flash_lite` (while unlocking cleanly on standalone `quick_lookup` questions), and deduplicates multi-step tool loops so Steps 2..N execute in `<1 ms` with zero extra API calls or duplicate banners.
 - **Automatic Subagent Right-Sizing (`PreToolUse`):** Intercepts `invoke_subagent` calls when `Model` is unset or `"inherit"` and assigns `flash_lite`, `flash`, or `pro` based on each subagent's task.
 - **Dynamic Model Auto-Discovery (`sync-models` & `list-models --refresh`):** Automatically discovers newly released Antigravity Desktop App and `agy` CLI models at runtime (for example `gemini-next-flash-medium` or `gemini-next-pro-high`), classifies each model into `flash_lite`, `flash`, or `pro` with an inferred thinking level, caches results in `~/.cache/gemini-decisions-router/discovered_models.json` (`0600`), and supports one-step adoption via `agy-router sync-models --apply-recommended`.
 - **4 MCP Tools (`create_decision`, `route_prompt`, `list_models`, `configure_router`):** Exposes calibrated decision gates, prompt classification, live target model discovery (`list_models(refresh=true)`), and live router configuration directly to your agents.
@@ -28,11 +28,24 @@ Evaluated live against `generativelanguage.googleapis.com/v1beta` across 100 str
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Gemini Decisions Router (Tier 0+1)** | **`278 ms` / `411 ms`** *(Tier 0: `<0.1 ms`)* | **`0`** | **`96.0%`** (`96/100`) | **`0.0%`** (`0/30`) | **`335.5 s` (`-29.1%`)** | **`$0.225` (`-56.3%`)** |
 | **Pure `gemini-decision-1` (Tier 1)** | **`235 ms` / `374 ms`** | **`0`** | **`96.0%`** (`96/100`) | **`0.0%`** (`0/30`) | `331.3 s` (`-30.0%`) | `$0.226` (`-56.2%`) |
-| **`GenerateContent` JSON (`gemini-2.5-flash`)** | `1,124 ms` / `1,644 ms` (`4.0x-4.8x` slower) | `144.3` | `100.0%` (`15/15`) | `0.0%` (`0/5`) | `416.0 s` (`-12.1%`) | `$0.258` (`-50.0%`) |
+| **`GenerateContent` JSON (`gemini-3.1-flash-lite-preview`, `thinking=0`)** | `709 ms` / `869 ms` (`2.6x-3.0x` slower) | `20.7` | `93.0%` (`93/100`) | `10.0%` (`3/30` missed) | `372.8 s` (`-21.2%`) | `$0.222` (`-57.0%`) |
+| **`GenerateContent` JSON (`gemini-2.5-flash`, `thinking=0`)** | `480 ms` / `552 ms` (`1.7x-2.0x` slower) | `24.1` | `93.0%` (`93/100`) | `10.0%` (`3/30` missed) | `346.8 s` (`-26.7%`) | `$0.229` (`-55.5%`) |
+| **`GenerateContent` JSON (`gemini-2.5-flash`, default thinking)** | `1,124 ms` / `1,644 ms` (`4.0x-4.8x` slower) | `144.3` | `100.0%` (`15/15`) | `0.0%` (`0/5`) | `416.0 s` (`-12.1%`) | `$0.258` (`-50.0%`) |
 | **Offline Lexical Baseline** | `0.01 ms` / `0.01 ms` | `0` | `79.0%` (`79/100`) | `36.7%` (`11/30` missed) | N/A | N/A |
 | **Always-Pro Baseline** | `0 ms` | `0` | `30.0%` (`70%` over-routed) | `0.0%` (`0/30`) | `473.2 s` *(Baseline)* | `$0.515` *(Baseline)* |
 
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full methodology, confusion matrices, confidence calibration (`ECE = 0.103`), and reproducibility commands (`python3 benchmarks/run_benchmark.py --mock` runs offline in `<0.1s`).
+### How Gemini Decisions Router Compares to Other LLM Routers
+
+| Router Family | Mechanism & Output Tokens | Typical Latency (`p50`) | Zero-Shot Rubric Flexibility | Confidence Calibration | Agentic Lifecycle (Thread Floor + Subagent Hooks) | Client / Infra Footprint |
+| :--- | :--- | :---: | :--- | :--- | :--- | :--- |
+| **Gemini Decisions Router (`gemini-decision-1`)** | **1-pass prefill (`choice` + `noul` + `score`), `0` output tokens** | **`235-278 ms`** *(Tier 0 `<0.1 ms`)* | **High** (`1-64` zero-shot questions in 1 call) | **Calibrated posteriors** (`ECE = 0.103`, `4/4` bins) | **Native** (Turn 2+ floor, `PreToolUse` `invoke_subagent`, `agy models` sync) | **Pure Python 3.11+ stdlib** (`0` pip pkgs, `0` GPUs, `~$0.046/1k`) |
+| **`flash-lite` / `flash` JSON Router** (LangGraph / LlamaIndex / PydanticAI) | Autoregressive JSON decode (`21-144` output tokens) | `480-1,124 ms` | High (JSON schema in prompt) | **Overconfident** (`100/100` in `[0.90, 1.00]`, `0.94` when wrong) | Manual DIY (`10%` stateless Pro-miss on Turn 2+) | Orchestration SDK + `~$0.03-$0.42/1k` |
+| **RouteLLM** (`mf`, `bert`, `causal_llm`) | Trained pairwise win-rate model (`0-1` token) | `~6-24 ms` GPU (`+50-150 ms` embed API) | Low (binary strong/weak; requires preference dataset) | Pairwise scalar only | Stateless single-turn | PyTorch + dedicated GPU (`~$500-$800/mo` L4) |
+| **Semantic Router** (Aurelio AI) | Encoder + static utterance cosine similarity (`0` tokens) | `~5-15 ms` local ONNX (`~45-120 ms` API) | Low-Medium (`10-50+` example utterances per route) | Uncalibrated cosine score | Stateless single-turn | `semantic-router` + `100-500 MB` ONNX model |
+| **Arch-Router-1.5B & vLLM Semantic Router** | Local `1.5B` JSON LM or `ModernBERT` Envoy filter | `~5-51 ms` GPU (`~250-600 ms` CPU) | Medium (`Arch-Router`) / Low (`ModernBERT` fine-tune) | Uncalibrated text or raw logits | Gateway HTTP only (no IDE subagent hooks) | Envoy proxy + K8s GPU/Rust cluster |
+| **Hosted Meta-Routers** (NotDiamond, Martian, `openrouter/auto`) | SaaS meta-classifier or multi-vendor gateway proxy | `~20-150 ms` | Low (`cost`/`quality` sliders or labeled eval sets) | Opaque server-side selection | Gateway stickiness only | External SaaS SDK or third-party traffic egress |
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full methodology, confusion matrices, confidence calibration (`ECE = 0.103`), `flash-lite` head-to-head breakdowns, framework citations, and live streaming benchmark commands (`python3 benchmarks/run_benchmark.py --mock` and `python3 benchmarks/run_router_head_to_head.py --mock`).
 
 ## Authentication Modes
 
@@ -129,9 +142,10 @@ See [docs/API_KEY_QUICKSTART.md](docs/API_KEY_QUICKSTART.md) for a complete walk
 
 You can observe every routing decision in real time across both surfaces:
 
-### 1. Inline Zero-Token `"✦ Routed with Intent"` Banners
+### 1. Inline `"✦ Routed with Intent"` Banners Across Desktop App & `agy` CLI
 
-- **User Prompts (`PreInvocation`):** On Step 1 of every user turn, the hook injects `systemMessage.metadata.user_markdown` alongside `renderInfo` with `"systemMessage": ""`. Because `metadata.user_markdown` is rendered directly by the UI and terminal renderer while `"systemMessage"` is empty, you see the route inline in **both** the Antigravity Desktop App and `agy` CLI at **0 model context tokens**.
+- **Antigravity Desktop App (`PreInvocation`, 0 Model Tokens):** Injects `systemMessage.renderInfo` with `"systemMessage": ""` so you see the full `"✦ Routed with Intent"` card inline in the Desktop App with **0 prompt token overhead**.
+- **`agy` CLI (`PreInvocation`, `cli_inline_banner: true`):** When running inside `agy` CLI (`_is_agy_cli_environment`) and `verbosity` is not `silent`, Step 1 prepends a clean 1-line inline routing badge (`> ✦ **Routed with Intent** -> \`gemini-3.1-flash-lite\` [Low] · 96% · 241 ms`) directly at the top of the CLI response. Toggle anytime with `agy-router set-verbosity --no-cli-inline-banner` or `configure_router({"cli_inline_banner": false})`.
 - **Subagent Dispatches (`PreToolUse`):** Whenever `invoke_subagent` is right-sized from `"inherit"`, the hook attaches an inline tool notice (`✦ Routed with Intent -> subagent Model=flash_lite (95% | 180 ms)`) whenever verbosity is not `silent`.
 
 ### 2. Configurable Verbosity Presets (`silent`, `compact`, `normal`, `verbose`)
@@ -304,6 +318,7 @@ agy plugin validate . --strict
 
 ## Repository Layout
 
+- `rules/AGENTS.md`: Contributor architecture map, security/hermeticity invariants, hook/MCP contracts, and TDD/benchmark commands (`trigger: model_decision`)
 - `plugin.json`, `mcp_config.json`, `hooks.json`: Antigravity plugin (`category: "agents"`), MCP, and hook manifests
 - `install.sh`: Installer for `~/.gemini/config/plugins/gemini-decisions-router`, `~/.local/bin/agy-router`, and `agy plugin validate --strict`
 - `decisions_engine.py`: Keyless ADC resolver, `0600` `.env` loader, Decisions HTTP client, input/file security validator, dynamic Antigravity / `agy` model auto-discovery, and 2-tier router
@@ -313,10 +328,10 @@ agy plugin validate . --strict
 - `docs/CUSTOMER_ONBOARDING.md`: Enterprise Google Cloud customer rollout guide
 - `docs/AUTHENTICATION_ADC.md`: Keyless ADC architecture and troubleshooting guide
 - `docs/API_KEY_QUICKSTART.md`: Frictionless install, `0600` `.env` setup, inline visibility, and CLI/MCP usage guide
-- `docs/BENCHMARKS.md`: Live 100-prompt routing accuracy, latency percentiles, calibration, and end-to-end cost/time report
+- `docs/BENCHMARKS.md`: Live 100-prompt routing accuracy, `flash-lite` head-to-head study, framework comparison, calibration, and E2E cost/time report
 - `docs/TESTING_STRATEGY.md`: Target model catalog, security/deduplication/anti-hang test strategy, and live telemetry results
-- `benchmarks/`: `prompts_100.json` dataset, `run_benchmark.py` (live + `--mock` runner), `render_charts.py`, and `results_100.json`
-- `tests/test_external_plugin.py`: Unit, mock HTTP, `.env` permission/symlink, verbosity, deduplication, pre-flight, and hygiene test suite
+- `benchmarks/`: `prompts_100.json` dataset, `run_benchmark.py` and `run_router_head_to_head.py` (live + `--mock` streaming runners), `render_charts.py`, `results_100.json`, and `results_flash_lite_router_100.json`
+- `tests/test_external_plugin.py`: Unit, mock HTTP, `.env` permission/symlink, verbosity, deduplication, pre-flight, benchmark, and hygiene test suite
 
 ## License
 

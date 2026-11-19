@@ -1,3 +1,8 @@
+---
+trigger: model_decision
+description: "Contributor architecture map, security and hermeticity invariants, hook/MCP contracts, and TDD/benchmark commands when editing the gemini-decisions-router repository."
+---
+
 # AGENTS.md - Engineering & Architecture Guide
 
 This document defines the architecture, non-negotiable security invariants, runtime hook/MCP contracts, and verification commands for contributors and coding agents working in `gemini-decisions-router`.
@@ -18,7 +23,7 @@ This document defines the architecture, non-negotiable security invariants, runt
 | `mcp_config.json` | MCP stdio server manifest invoking `python3 -E -s -B -u ${PLUGIN_ROOT}/mcp_server.py` (isolated environment, no user site-packages, no `.pyc` generation, unbuffered binary stdio). |
 | `install.sh` | Verifies Python 3.11+, installs plugin files into `${ANTIGRAVITY_PLUGINS_DIR:-~/.gemini/config/plugins}/gemini-decisions-router`, writes the executable `${BIN_DIR:-~/.local/bin}/agy-router` wrapper, and runs `agy plugin validate ... --strict` when `agy` is on `PATH`. |
 | `skills/gemini-decisions-router/SKILL.md` | Agent skill instructions loaded by Antigravity covering MCP tool schemas, hook behavior, `agy-router` CLI subcommands, and safety rules. |
-| `benchmarks/` | Evaluation harness: `prompts_100.json` (`N=100` stratified prompts across 6 categories + `N=15` E2E subset), `run_benchmark.py` (live API + deterministic offline `--mock` CI runner), `render_charts.py` (`1600x1040` Pillow dashboard generator outputting `assets/benchmark-dashboard.png`), and `results_100.json`. |
+| `benchmarks/` | Evaluation harness: `prompts_100.json` (`N=100` stratified prompts across 6 categories + `N=15` E2E subset), `run_benchmark.py` (live API + deterministic offline `--mock` CI runner with live `stdout` routing stats), `run_router_head_to_head.py` (`N=100` `flash-lite` & `flash` JSON routers vs `gemini-decision-1` runner), `render_charts.py` (`1600x1040` Pillow dashboard generator outputting `assets/benchmark-dashboard.png`), `results_100.json`, and `results_flash_lite_router_100.json`. |
 | `docs/` | Operator and architecture guides: `AUTHENTICATION_ADC.md`, `API_KEY_QUICKSTART.md`, `CUSTOMER_ONBOARDING.md`, `BENCHMARKS.md`, and `TESTING_STRATEGY.md`. |
 | `tests/test_external_plugin.py` | Offline, hermetic TDD test suite covering unit logic, mock HTTP servers (Gemini ADC, Vertex ADC, API key, Language Server CSRF/RPCs), `.env` and cache permissions, file security, multi-step hook deduplication, anti-hang pre-flight checks, MCP protocol hardening, `--mock` benchmarks, and public-repo hygiene. |
 
@@ -62,9 +67,10 @@ Every change to this repository must preserve the following invariants:
   - **Tier 0 (`<1 ms`):** `_fast_rule_route` handles explicit user tier overrides (`"use gemini pro"`, `"use flash lite"`), short confirmations (`"lgtm"`, `"ship it"`), concurrency/crash markers (`"race condition"`, `"deadlock"`, `"segfault"`, `"stack trace"`), and short Turn 2+ continuations (`<= 5` words or `_THREAD_CONTINUATIONS`).
   - **Tier 1 (`gemini-decision-1`, `1.5s` hook budget, `0` output tokens):** Evaluates `task_class` (`choice`), `needs_pro_reasoning` (`noul`), and `effort_rubric` (`score`) in a single prefill pass under `hook_timeout_s` (default `1.5s`, configurable via `router_config.json` or `GEMINI_DECISIONS_HOOK_TIMEOUT_S`, clamped to `[0.3, 8.0]`). On transient timeout/quota/unavailable errors, trips a `45s` circuit-breaker (`api_cooldown.json`) and falls back to `<1 ms` `_lexical_fallback_route` so user turns never stall.
 - **Per-message tool-loop deduplication (`<1 ms` on Steps 2..N):** Records `(conversationId, prompt_hash)` in `seen_turn_<conv>.json` (`600s` TTL). Within a multi-step agent tool loop where `lastUserInput` stays constant across Steps 2..N, `PreInvocation` short-circuits in `<1 ms` and returns `{}` with zero extra API calls and zero duplicate banners. Switched turns use `reroute_<conv>.json` (`600s` TTL) to render their switched banner once on Step 2 and return `{}` on Steps 3..N.
-- **Asymmetric Turn 2+ thread floor:** Persists `thread_<conv>.json` (`7d` TTL) and runs `_apply_thread_floor` on Turn 2+ so brief follow-ups (`"yes go ahead"`, `"fix it"`) never downgrade an active higher-tier session (for example `pro` -> `flash_lite`), preserving reasoning continuity and KV-cache locality unless the user explicitly requests a different model tier.
-- **Zero-token inline banner across App & `agy` CLI (`silent`, `compact`, `normal`, `verbose`):**
-  - Injects `injectSteps` containing `"systemMessage": ""` (`0` model context tokens), `metadata.user_markdown` (rendered inline by both the Antigravity Desktop App and `agy` CLI), and `renderInfo`.
+- **Asymmetric Turn 2+ thread floor (`enable_thread_floor`):** Persists `thread_<conv>.json` (`7d` TTL) for coding, data, docs, and architecture turns (`locked_task_class != "quick_lookup"`) and runs `_apply_thread_floor` on Turn 2+ so brief follow-ups (`"yes go ahead"`, `"do step 2 next"`) never downgrade an active higher-tier session (`pro` -> `flash_lite`), while standalone high-confidence (`>0.85`) `quick_lookup` questions cleanly unlock back to `flash_lite`.
+- **Inline `"✦ Routed with Intent"` banners across Desktop App & `agy` CLI (`silent`, `compact`, `normal`, `verbose`):**
+  - On the Antigravity Desktop App, injects `injectSteps` containing `"systemMessage": ""` (`0` model context tokens) and `renderInfo` (never attach a string `"metadata"` value on `HookSystemMessage`, which triggers a protobuf scrubber type-mismatch panic in Antigravity).
+  - In `agy` CLI (`_is_agy_cli_environment` is `True` and `cli_inline_banner` is `True`), injects a concise Step-1 `systemMessage` badge instruction (`> ✦ **Routed with Intent** -> ...`) when `verbosity != "silent"`.
   - When `verbosity == "silent"`, returns `{}` (no `injectSteps`) while still recording the event in `~/.cache/gemini-decisions-router/telemetry.jsonl`.
 - **Mandatory `GetCascadeTrajectory` ownership pre-flight (`auto_switch`):**
   - Before `auto_switch` can spawn background `redispatch` and return `{"terminationBehavior": "terminate"}`, `_verify_cascade_ownership(conv_id)` calls `GetCascadeTrajectory` (`400 ms` timeout) against the discovered Language Server to prove it owns `conversationId`.
@@ -81,7 +87,7 @@ Every change to this repository must preserve the following invariants:
   1. `create_decision`: Evaluates 1 to 32 shared `text` or allowlisted `file` inputs across 1 to 64 `noul`, `choice`, and `score` questions (`0` output tokens).
   2. `route_prompt`: Classifies a prompt or subagent task into `flash_lite`, `flash`, or `pro` with `recommended_model_id`, `thinking_level` (`1..4`), `confidence`, and calibrated probabilities.
   3. `list_models`: Returns built-in, auto-discovered (`refresh: bool`), and custom target models, Antigravity model enums, `suggested_tier_models`, and `active_tier_models`.
-  4. `configure_router`: Validates and persists `mode`, `verbosity`, `min_confidence`, `enable_subagent_routing`, and `tier_models` in `router_config.json`.
+  4. `configure_router`: Validates and persists `mode`, `verbosity`, `min_confidence`, `enable_subagent_routing`, `enable_thread_floor`, `cli_inline_banner`, and `tier_models` in `router_config.json`.
 - Rejects non-standard JSON constants (`NaN`, `Infinity`, `-Infinity`) via `_reject_json_constant` and scrubs `GEMINI_API_KEY` and `GOOGLE_OAUTH_ACCESS_TOKEN` from `stderr` logs via `_log_stderr`.
 
 ---
@@ -132,10 +138,16 @@ agy-router stats
 
 ### 4. Benchmarks & Dashboard Chart Generation
 ```bash
-# Deterministic offline CI benchmark verification (<0.5s, zero network calls)
+# Deterministic offline CI benchmark verification (<0.5s, zero network calls, live stdout stats)
 python3 benchmarks/run_benchmark.py \
   --dataset benchmarks/prompts_100.json \
   --output /tmp/mock_results.json \
+  --mock
+
+# Deterministic offline N=100 flash-lite & flash JSON head-to-head verification
+python3 benchmarks/run_router_head_to_head.py \
+  --dataset benchmarks/prompts_100.json \
+  --output /tmp/mock_head_to_head.json \
   --mock
 
 # Live API benchmark run (N=100 routing + N=15 E2E completions; requires ADC or GEMINI_API_KEY)

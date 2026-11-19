@@ -1693,7 +1693,17 @@ _SKIP_LOG_PREFIX_RE = re.compile(
 )
 _DISCOVERED_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]{1,80}$")
 _SAFE_MODEL_ENUM_RE = re.compile(r"^[A-Z0-9_]{3,96}$")
+_THINKING_VARIANT_SUFFIX_RE = re.compile(
+    r"-(?:low|medium|high|xhigh|max)$", re.IGNORECASE
+)
 _CSRF_TOKEN_RE = re.compile(r'["\']csrfToken["\']\s*:\s*["\']([^"\']+)["\']')
+_CMDLINE_CSRF_RE = re.compile(
+    r"(?:^|\s)--csrf[-_]token(?:=|\s+)([A-Za-z0-9._:-]{4,256})"
+)
+_CMDLINE_PORT_RE = re.compile(
+    r"(?:^|\s)--(?:hub-port|http[-_]port|server[-_]port|port)(?:=|\s+)(\d{2,5})\b"
+)
+_LS_MAX_RESPONSE_BYTES = 33_554_432  # 32 MiB cap for large trajectory/model JSONs
 _VERSION_PAIR_RE = re.compile(r"(?:^|[-_ ])(\d+)(?:\.(\d+))?(?=$|[-_ )])")
 _LITE_TOKEN_RE = re.compile(r"(?<![a-z])(?:lite|nano)(?![a-z])")
 _FLASH_WORD_RE = re.compile(r"(?<![a-z])flash(?![a-z])")
@@ -1977,12 +1987,261 @@ def _parse_ls_models_payload(payload: Any) -> list[dict[str, Any]]:
   return out
 
 
-def discover_models_from_ls(
+def propagate_sibling_model_enums(
+    models: Sequence[Mapping[str, Any]],
+    *,
+    seed_enums: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+  """Backfills shared LS `MODEL_*` enums across `-low`/`-medium`/`-high`/`-xhigh`/`-max` siblings."""
+  base_to_enum: dict[str, str] = {}
+  if isinstance(seed_enums, Mapping):
+    for raw_id, raw_enum in seed_enums.items():
+      mid = str(raw_id or "").strip()
+      enum_val = str(raw_enum or "").strip()
+      if not mid or not _SAFE_MODEL_ENUM_RE.fullmatch(enum_val):
+        continue
+      base_id = _THINKING_VARIANT_SUFFIX_RE.sub("", mid)
+      if mid == base_id or base_id not in base_to_enum:
+        base_to_enum[base_id] = enum_val
+
+  # Pass 1: prefer exact base IDs first, then any sibling variant with a valid enum.
+  for entry in models:
+    if not isinstance(entry, Mapping):
+      continue
+    mid = str(entry.get("id") or "").strip()
+    enum_val = str(entry.get("enum") or "").strip()
+    if not mid or not _SAFE_MODEL_ENUM_RE.fullmatch(enum_val):
+      continue
+    base_id = _THINKING_VARIANT_SUFFIX_RE.sub("", mid)
+    if mid == base_id:
+      base_to_enum[base_id] = enum_val
+    elif base_id not in base_to_enum:
+      base_to_enum[base_id] = enum_val
+
+  # Pass 2: backfill only entries whose `enum` is currently empty.
+  out: list[dict[str, Any]] = []
+  for entry in models:
+    if not isinstance(entry, Mapping):
+      continue
+    item = dict(entry)
+    mid = str(item.get("id") or "").strip()
+    enum_val = str(item.get("enum") or "").strip()
+    if mid and not enum_val:
+      base_id = _THINKING_VARIANT_SUFFIX_RE.sub("", mid)
+      inherited = base_to_enum.get(base_id, "")
+      if inherited:
+        item["enum"] = inherited
+    out.append(item)
+  return out
+
+
+def _read_listening_socket_inodes(proc_root: pathlib.Path) -> dict[str, int]:
+  """Maps TCP_LISTEN socket inode -> port from /proc/net/tcp and /proc/net/tcp6."""
+  inode_to_port: dict[str, int] = {}
+  for net_name in ("tcp", "tcp6"):
+    try:
+      lines = (proc_root / "net" / net_name).read_text(encoding="utf-8").splitlines()
+    except OSError:
+      continue
+    for line in lines[1:]:
+      cols = line.split()
+      if len(cols) < 10 or cols[3] != "0A":
+        continue
+      local_parts = cols[1].split(":")
+      if len(local_parts) != 2:
+        continue
+      try:
+        port = int(local_parts[1], 16)
+      except ValueError:
+        continue
+      inode = cols[9]
+      if 0 < port <= 65535 and inode and inode != "0":
+        inode_to_port[inode] = port
+  return inode_to_port
+
+
+def discover_local_ls_candidates(
+    *,
+    proc_root: pathlib.Path | None = None,
+) -> list[tuple[str, str]]:
+  """Discovers `(host:port, csrf_hint)` candidates from env, `/proc`, and port 5387."""
+  env_addr = _normalize_local_ls_addr(
+      os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
+  )
+  env_csrf = (
+      os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
+      or os.environ.get("ANTIGRAVITY_SERVER_CSRF_TOKEN", "")
+  ).strip()
+  if env_addr:
+    return [(env_addr, env_csrf)]
+
+  candidates: list[tuple[str, str]] = []
+  seen_addrs: set[str] = set()
+
+  def _add(port: int, csrf_hint: str) -> None:
+    if not (1 <= port <= 65535):
+      return
+    addr = f"127.0.0.1:{port}"
+    if addr in seen_addrs:
+      return
+    seen_addrs.add(addr)
+    candidates.append((addr, csrf_hint))
+
+  proot = proc_root or pathlib.Path("/proc")
+  if proot.is_dir():
+    inode_ports = _read_listening_socket_inodes(proot)
+    my_uid = os.getuid() if hasattr(os, "getuid") else -1
+
+    # Walk ancestor PIDs first so a hook finds its own parent LS/Hub immediately.
+    ordered_pids: list[int] = []
+    seen_pids: set[int] = set()
+    cur_pid = os.getppid()
+    for _ in range(8):
+      if cur_pid <= 1 or cur_pid in seen_pids:
+        break
+      seen_pids.add(cur_pid)
+      ordered_pids.append(cur_pid)
+      try:
+        status_txt = (proot / str(cur_pid) / "status").read_text(encoding="utf-8")
+      except OSError:
+        break
+      next_pid = 0
+      for sline in status_txt.splitlines():
+        if sline.startswith("PPid:"):
+          try:
+            next_pid = int(sline.split(":", 1)[1].strip())
+          except ValueError:
+            next_pid = 0
+          break
+      cur_pid = next_pid
+
+    try:
+      for entry in proot.iterdir():
+        if not entry.name.isdigit():
+          continue
+        pid_int = int(entry.name)
+        if pid_int in seen_pids:
+          continue
+        try:
+          if my_uid >= 0 and entry.stat().st_uid != my_uid:
+            continue
+        except OSError:
+          continue
+        seen_pids.add(pid_int)
+        ordered_pids.append(pid_int)
+    except OSError:
+      pass
+
+    for pid_val in ordered_pids:
+      pdir = proot / str(pid_val)
+      try:
+        raw_cmd = (pdir / "cmdline").read_bytes()
+      except OSError:
+        continue
+      tokens = [
+          t.decode("utf-8", "replace").strip()
+          for t in raw_cmd.split(b"\x00")
+          if t.strip()
+      ]
+      if not tokens:
+        continue
+      exe_base = os.path.basename(tokens[0]).lower()
+      cmd_joined = " ".join(tokens)
+      is_ls_proc = exe_base.startswith("language_server") or (
+          exe_base == "agy"
+          and (
+              "--hub" in cmd_joined
+              or "--csrf_token" in cmd_joined
+              or len(tokens) == 1
+          )
+      )
+      if not is_ls_proc:
+        continue
+
+      proc_csrf = ""
+      m_csrf = _CMDLINE_CSRF_RE.search(cmd_joined)
+      if m_csrf:
+        proc_csrf = m_csrf.group(1).strip()
+      if not proc_csrf:
+        try:
+          raw_env = (pdir / "environ").read_bytes()
+          for kv in raw_env.split(b"\x00"):
+            if kv.startswith((
+                b"ANTIGRAVITY_SERVER_CSRF_TOKEN=",
+                b"ANTIGRAVITY_CSRF_TOKEN=",
+            )):
+              val = kv.split(b"=", 1)[1].decode("utf-8", "replace").strip()
+              if val:
+                proc_csrf = val
+                break
+        except OSError:
+          pass
+
+      # 1. Explicit cmdline port flags (--hub-port, --port, etc.)
+      for m_port in _CMDLINE_PORT_RE.finditer(cmd_joined):
+        try:
+          _add(int(m_port.group(1)), proc_csrf or env_csrf)
+        except ValueError:
+          pass
+
+      # 2. Ephemeral listening TCP sockets owned by this process
+      if inode_ports:
+        fd_ports: list[int] = []
+        try:
+          for fd_entry in (pdir / "fd").iterdir():
+            try:
+              target = os.readlink(fd_entry)
+            except OSError:
+              continue
+            if target.startswith("socket:[") and target.endswith("]"):
+              ino = target[8:-1]
+              if ino in inode_ports:
+                fd_ports.append(inode_ports[ino])
+        except OSError:
+          pass
+        for pnum in sorted(set(fd_ports)):
+          _add(pnum, proc_csrf or env_csrf)
+
+  _add(5387, env_csrf)
+  return candidates
+
+
+def _extract_ls_enum_hints(payload: Any) -> dict[str, str]:
+  """Extracts `model_id -> MODEL_*` enum hints from LS `models` map (even when label is omitted)."""
+  body = (
+      payload.get("response")
+      if isinstance(payload, Mapping)
+      and isinstance(payload.get("response"), Mapping)
+      else payload
+  )
+  if not isinstance(body, Mapping):
+    return {}
+  raw_models = body.get("models")
+  hints: dict[str, str] = {}
+  if isinstance(raw_models, Mapping):
+    for raw_mid, info in raw_models.items():
+      mid = str(raw_mid or "").strip()
+      if not mid or not isinstance(info, Mapping) or info.get("isInternal"):
+        continue
+      moa = (
+          info.get("modelOrAlias")
+          if isinstance(info.get("modelOrAlias"), Mapping)
+          else {}
+      )
+      raw_enum = str(
+          info.get("enum") or info.get("model") or moa.get("model") or ""
+      ).strip()
+      if _SAFE_MODEL_ENUM_RE.fullmatch(raw_enum):
+        hints[mid] = raw_enum
+  return hints
+
+
+def _query_ls_models_and_hints(
     ls_addr: str = "",
     csrf_token: str = "",
     timeout_s: float = 0.6,
-) -> list[dict[str, Any]]:
-  """Queries local Antigravity Language Server GetAvailableModels RPC."""
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+  """Queries local Antigravity Language Server(s) for models and enum hints."""
   opener = urllib.request.build_opener(
       _NoRedirectHandler(), urllib.request.ProxyHandler({})
   )
@@ -1991,14 +2250,16 @@ def discover_models_from_ls(
   def _fetch_csrf(candidate: str) -> str:
     try:
       req = urllib.request.Request(f"http://{candidate}/", method="GET")
-      with opener.open(req, timeout=min(eff_timeout, 0.4)) as resp:
+      with opener.open(req, timeout=min(eff_timeout, 0.35)) as resp:
         html = resp.read(65536).decode("utf-8", "replace")
       m = _CSRF_TOKEN_RE.search(html)
       return m.group(1) if m else ""
     except Exception:  # pylint: disable=broad-except
       return ""
 
-  def _call_get_models(target_addr: str, target_csrf: str) -> list[dict[str, Any]]:
+  def _call_get_models(
+      target_addr: str, target_csrf: str
+  ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     rpc_url = (
         f"http://{target_addr}"
         "/exa.language_server_pb.LanguageServerService/GetAvailableModels"
@@ -2015,43 +2276,54 @@ def discover_models_from_ls(
     )
     try:
       with opener.open(req, timeout=eff_timeout) as resp:
-        raw = resp.read(2 * 1024 * 1024)
+        raw = resp.read(_LS_MAX_RESPONSE_BYTES)
       parsed = json.loads(raw.decode("utf-8"))
-      return _parse_ls_models_payload(parsed)
+      return _parse_ls_models_payload(parsed), _extract_ls_enum_hints(parsed)
     except Exception:  # pylint: disable=broad-except
-      return []
+      return [], {}
 
   if ls_addr and ls_addr.strip():
     addr = _normalize_local_ls_addr(ls_addr)
     if not addr:
-      return []
+      return [], {}
     csrf = (csrf_token or "").strip() or _fetch_csrf(addr)
     if not csrf:
-      return []
+      return [], {}
     return _call_get_models(addr, csrf)
 
-  attempts: list[tuple[str, str]] = []
-  env_addr = _normalize_local_ls_addr(
-      os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
-  )
-  env_csrf = (
-      csrf_token
-      or os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
-      or os.environ.get("ANTIGRAVITY_SERVER_CSRF_TOKEN", "")
-  ).strip()
-  if env_addr:
-    attempts.append((env_addr, env_csrf))
-  if env_addr != "127.0.0.1:5387":
-    attempts.append(("127.0.0.1:5387", ""))
-
-  for cand_addr, cand_csrf in attempts:
-    tok = cand_csrf or _fetch_csrf(cand_addr)
+  override_csrf = (csrf_token or "").strip()
+  combined_models: list[dict[str, Any]] = []
+  seen_ids: set[str] = set()
+  combined_hints: dict[str, str] = {}
+  for cand_addr, cand_csrf in discover_local_ls_candidates():
+    tok = override_csrf or cand_csrf or _fetch_csrf(cand_addr)
     if not tok:
       continue
-    found = _call_get_models(cand_addr, tok)
-    if found:
-      return found
-  return []
+    found_models, found_hints = _call_get_models(cand_addr, tok)
+    for k, v in found_hints.items():
+      combined_hints.setdefault(k, v)
+    for item in found_models:
+      mid = str(item.get("id") or "")
+      if mid and mid not in seen_ids:
+        seen_ids.add(mid)
+        combined_models.append(item)
+      elif mid in seen_ids and item.get("enum"):
+        for prev in combined_models:
+          if prev.get("id") == mid and not prev.get("enum"):
+            prev["enum"] = item["enum"]
+  return combined_models, combined_hints
+
+
+def discover_models_from_ls(
+    ls_addr: str = "",
+    csrf_token: str = "",
+    timeout_s: float = 0.6,
+) -> list[dict[str, Any]]:
+  """Queries local Antigravity Language Server GetAvailableModels RPC."""
+  models, _ = _query_ls_models_and_hints(
+      ls_addr=ls_addr, csrf_token=csrf_token, timeout_s=timeout_s
+  )
+  return models
 
 
 def _normalize_cached_model_entry(entry: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -2179,11 +2451,13 @@ def discover_installed_models(
                 if norm is not None and norm["id"] not in seen_cached:
                   seen_cached.add(norm["id"])
                   cached_out.append(norm)
-            return cached_out
+            return propagate_sibling_model_enums(
+                cached_out, seed_enums=MODEL_ENUMS
+            )
     except (OSError, ValueError, TypeError):
       pass
 
-  ls_models = discover_models_from_ls()
+  ls_models, ls_enum_hints = _query_ls_models_and_hints()
   cli_models: list[dict[str, Any]] = []
   if run_cli_fallback:
     agy_path = _resolve_agy_binary(agy_bin)
@@ -2238,7 +2512,14 @@ def discover_installed_models(
       merged_by_id[mid] = dict(ls_item)
       ordered_ids.append(mid)
 
-  merged = [merged_by_id[mid] for mid in ordered_ids]
+  for mid, item in merged_by_id.items():
+    if not item.get("enum") and mid in ls_enum_hints:
+      item["enum"] = ls_enum_hints[mid]
+
+  merged = propagate_sibling_model_enums(
+      [merged_by_id[mid] for mid in ordered_ids],
+      seed_enums={**MODEL_ENUMS, **ls_enum_hints},
+  )
   if merged:
     _write_discovered_cache(cpath, merged)
   return merged
@@ -2468,6 +2749,7 @@ def list_available_target_models(
           "source": "custom",
       })
 
+  models = propagate_sibling_model_enums(models, seed_enums=MODEL_ENUMS)
   env = os.environ if environ is None else environ
   env_overrides = {
       tier: str(env.get(env_key)).strip()
