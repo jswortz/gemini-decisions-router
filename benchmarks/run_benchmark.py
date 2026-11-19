@@ -27,6 +27,7 @@ import pathlib
 import ssl
 import statistics
 import sys
+import threading
 import time
 from typing import Any
 import urllib.error
@@ -540,6 +541,7 @@ def evaluate_decisions_strategy(
       "output_tokens": 0,
       "candidates_tokens": 0,
       "thoughts_tokens": 0,
+      "thread_floor_applied": bool(res.get("thread_floor_applied")),
       "tier_correct": res["recommended_tier"] == item["expected_tier"],
       "task_class_correct": res["task_class"] == item["expected_task_class"],
       "probabilities": res.get("probabilities", {}),
@@ -926,15 +928,94 @@ def summarize_strategy(
   }
 
 
+def _safe_print(text: str = "") -> None:
+  try:
+    print(text, flush=True)
+  except BrokenPipeError:
+    try:
+      sys.stdout.close()
+    except OSError:
+      pass
+    raise SystemExit(0) from None
+
+
+def _classify_backend_bucket(
+    rec: Mapping[str, Any], item: Mapping[str, Any]
+) -> str:
+  if rec.get("thread_floor_applied"):
+    return "thread_lock"
+  turn_cnt = int(item.get("user_turn_count") or 1)
+  t_state = item.get("thread_state")
+  if (
+      turn_cnt >= 2
+      and isinstance(t_state, Mapping)
+      and str(rec.get("backend") or "") not in ("", "static_always_pro")
+      and not str(rec.get("backend") or "").startswith("generateContent:")
+  ):
+    return "thread_lock"
+  if not rec.get("api_called", True):
+    return "fast_rules"
+  b_str = str(rec.get("backend") or "gemini_api")
+  if b_str in ("mock_decisions_api", "gemini_api", "gemini_adc"):
+    return "gemini_api"
+  return b_str.removeprefix("generateContent:")
+
+
+def _format_live_route_line(
+    idx: int,
+    total: int,
+    rec: Mapping[str, Any],
+    item: Mapping[str, Any],
+    tier_models: Mapping[str, str],
+) -> str:
+  status = "PASS" if rec.get("tier_correct") else "MISS"
+  cat = str(rec.get("category") or item.get("category") or "")[:18]
+  tier = str(rec.get("recommended_tier") or "flash")
+  model_lbl = tier_models.get(tier, tier).removesuffix("-preview")[:21]
+  conf = float(rec.get("confidence") or 0.0)
+  lat_ms = float(rec.get("latency_ms") or 0.0)
+  b_bucket = _classify_backend_bucket(rec, item)[:16]
+  raw_p = " ".join(str(item.get("prompt") or "").split())
+  snippet = raw_p if len(raw_p) <= 36 else raw_p[:33] + "..."
+  return (
+      f"[{idx:03d}/{total:03d}] {status:4s}  {cat:<18s} -> "
+      f"{tier:<10s} ({model_lbl:<21s}) | conf={conf:0.2f} | "
+      f"{lat_ms:7.1f} ms | {b_bucket:<16s} | \"{snippet}\""
+  )
+
+
 def _run_items(
     items: list[dict[str, Any]],
     fn: Callable[[dict[str, Any]], dict[str, Any]],
     concurrency: int,
+    *,
+    stream_title: str = "",
+    tier_models: Mapping[str, str] | None = None,
+    quiet: bool = True,
 ) -> list[dict[str, Any]]:
+  total = len(items)
+  if stream_title and not quiet:
+    _safe_print(f"\n--- Streaming Live Routes: {stream_title} (N={total}) ---")
+  print_lock = threading.Lock()
+  counter = {"done": 0}
+  t_models = tier_models or {}
+
+  def _wrapped(item: dict[str, Any]) -> dict[str, Any]:
+    rec = fn(item)
+    if stream_title and not quiet and isinstance(rec, Mapping):
+      with print_lock:
+        counter["done"] += 1
+        _safe_print(
+            _format_live_route_line(
+                counter["done"], total, rec, item, t_models
+            )
+        )
+    return rec
+
   if concurrency <= 1:
-    return [fn(item) for item in items]
+    return [_wrapped(item) for item in items]
   with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-    return list(pool.map(fn, items))
+    return list(pool.map(_wrapped, items))
 
 
 def compute_e2e_and_projections(
@@ -1284,6 +1365,7 @@ def run_benchmark(
     output_path: pathlib.Path,
     mock: bool = False,
     concurrency: int = 1,
+    quiet: bool = False,
 ) -> dict[str, Any]:
   """Runs the complete routing and end-to-end benchmark suite."""
   t_suite_start = time.perf_counter()
@@ -1316,6 +1398,9 @@ def run_benchmark(
           it, enable_fast_rules=True, mock=mock, ctx=ctx
       ),
       concurrency,
+      stream_title="decisions_router_full (Tier 0 + gemini-decision-1)",
+      tier_models=tier_models,
+      quiet=quiet,
   )
 
   # 2. Evaluate all 100 prompts on `decisions_tier1_only` (100% pure `gemini-decision-1`).
@@ -1360,6 +1445,9 @@ def run_benchmark(
       sample_items,
       lambda it: evaluate_llm_json_router_item(it, mock=mock, ctx=ctx),
       concurrency,
+      stream_title=f"llm_json_router ({LLM_JSON_ROUTER_MODEL} sample)",
+      tier_models=tier_models,
+      quiet=quiet,
   )
 
   full_by_id = {str(r["id"]): r for r in full_records}
@@ -1481,44 +1569,90 @@ def _print_summary(results: Mapping[str, Any], output_path: pathlib.Path) -> Non
   lex = strat["lexical_only"]
   proj = results["e2e"]["projected_100_prompts"]
 
+  full_recs = results.get("records", {}).get("decisions_router_full", [])
+  fast_rules_cnt = sum(
+      1
+      for r in full_recs
+      if not r.get("api_called") and not r.get("thread_floor_applied")
+  )
+  thread_lock_cnt = sum(1 for r in full_recs if r.get("thread_floor_applied"))
+  gemini_api_cnt = sum(1 for r in full_recs if r.get("api_called"))
+  dist = full["routed_tier_distribution"]
+
+  border = "=" * 96
+  rule = "-" * 96
+  _safe_print(f"\n{border}")
+  _safe_print(
+      f"  ✦ ROUTED WITH INTENT | BENCHMARK ROUTING STATS "
+      f"(mode={meta['mode']}, N={meta['dataset_size']})"
+  )
+  _safe_print(border)
+  _safe_print(
+      f"  Tier Distribution:   "
+      f"flash_lite={dist['flash_lite']:2d} ({dist['flash_lite']}%) | "
+      f"flash={dist['flash']:2d} ({dist['flash']}%) | "
+      f"pro={dist['pro']:2d} ({dist['pro']}%)"
+  )
+  _safe_print(
+      f"  Backend Breakdown:   "
+      f"fast_rules={fast_rules_cnt:2d} | "
+      f"gemini_api={gemini_api_cnt:2d} | "
+      f"thread_lock={thread_lock_cnt:2d}"
+  )
+  _safe_print(rule)
+  _safe_print("  Per-Category Routing Accuracy (Decisions Tier 0+1):")
+  for cat in CATEGORIES_ORDER:
+    if cat not in full["per_category"]:
+      continue
+    c = full["per_category"][cat]
+    _safe_print(
+        f"    {cat:<25s} N={c['count']:2d} | "
+        f"TierAcc={c['tier_accuracy_pct']:5.1f}% ({c['tier_correct']:2d}/{c['count']:2d}) | "
+        f"TaskClassAcc={c['task_class_accuracy_pct']:5.1f}% | "
+        f"ProMiss={c['pro_miss_count']}/{c['expected_pro_count']} | "
+        f"mean={c['mean_latency_ms']:6.1f}ms"
+    )
+  _safe_print(rule)
+
   speedup_p50 = round(
       float(llm["latency"]["p50_ms"]) / max(1.0, float(full["latency"]["p50_ms"])),
       2,
   )
-  print(
+  _safe_print(
       f"[benchmark:{meta['mode']}] dataset={meta['dataset_size']} "
       f"sample_e2e={meta['sample_e2e_size']} concurrency={meta['concurrency']} "
       f"elapsed={meta['suite_wall_time_s']}s"
   )
-  print(
+  _safe_print(
       f"  Router Overhead p50/p90/p99 (ms): "
       f"Tier0+1={full['latency']['p50_ms']}/{full['latency']['p90_ms']}/{full['latency']['p99_ms']} | "
       f"PureTier1={t1['latency']['p50_ms']}/{t1['latency']['p90_ms']}/{t1['latency']['p99_ms']} (0 out tok) | "
       f"GenerateContent={llm['latency']['p50_ms']}/{llm['latency']['p90_ms']}/{llm['latency']['p99_ms']} "
       f"({llm['tokens']['mean_output_tokens']} out tok, {speedup_p50}x slower p50)"
   )
-  print(
+  _safe_print(
       f"  Exact Tier Accuracy (%):          "
       f"Tier0+1={full['accuracy']['exact_tier_accuracy_pct']}% | "
       f"PureTier1={t1['accuracy']['exact_tier_accuracy_pct']}% | "
       f"GenerateContent(N=15)={llm['accuracy']['exact_tier_accuracy_pct']}% | "
       f"Lexical={lex['accuracy']['exact_tier_accuracy_pct']}%"
   )
-  print(
+  _safe_print(
       f"  Critical Pro-Miss Rate (%):       "
       f"Tier0+1={full['accuracy']['pro_miss_rate_pct']}% | "
       f"PureTier1={t1['accuracy']['pro_miss_rate_pct']}% | "
       f"GenerateContent(N=15)={llm['accuracy']['pro_miss_rate_pct']}% | "
       f"Lexical={lex['accuracy']['pro_miss_rate_pct']}%"
   )
-  print(
+  _safe_print(
       f"  100-Prompt Projected E2E Time:    "
       f"Always-Pro={proj['always_pro']['total_e2e_s']}s -> "
       f"Decisions-Routed={proj['decisions_router_routed']['total_e2e_s']}s "
       f"(-{proj['decisions_router_routed']['time_saved_vs_always_pro_pct']}% time, "
       f"-{proj['decisions_router_routed']['cost_saved_vs_always_pro_pct']}% cost)"
   )
-  print(f"  Saved results -> {output_path}")
+  _safe_print(f"  Saved results -> {output_path}")
+  _safe_print(border)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1548,6 +1682,11 @@ def main(argv: list[str] | None = None) -> int:
       default=1,
       help="Worker concurrency (default: 1 for uncontended wall-clock percentiles).",
   )
+  parser.add_argument(
+      "--quiet",
+      action="store_true",
+      help="Suppress per-prompt streaming lines and print summary stats table only.",
+  )
   args = parser.parse_args(argv)
   if args.concurrency < 1 or args.concurrency > 32:
     parser.error("--concurrency must be between 1 and 32")
@@ -1557,6 +1696,7 @@ def main(argv: list[str] | None = None) -> int:
       output_path=args.output,
       mock=bool(args.mock),
       concurrency=int(args.concurrency),
+      quiet=bool(args.quiet),
   )
   _print_summary(results, args.output)
   return 0
