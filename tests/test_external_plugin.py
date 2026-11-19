@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import pathlib
 import re
+import stat
+import subprocess
 import sys
 import threading
 from typing import Any
@@ -400,6 +403,7 @@ def test_mcp_and_hooks_end_to_end(tmp_path: pathlib.Path) -> None:
       "create_decision",
       "route_prompt",
       "list_models",
+      "configure_router",
   }
 
   cfg_path = tmp_path / "router_config.json"
@@ -433,7 +437,9 @@ def test_mcp_and_hooks_end_to_end(tmp_path: pathlib.Path) -> None:
       state_dir=tmp_path,
       config_path=cfg_path,
   )
-  assert out_sub == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
+  assert out_sub["decision"] == "allow"
+  assert out_sub["overwrite"] == {"Model": "flash_lite"}
+  assert "Routed with Intent" in out_sub["reason"]
 
   telemetry_lines = [
       json.loads(line)
@@ -497,9 +503,6 @@ def test_wif_env_token_and_vertex_model_prefix_normalization() -> None:
 
 
 def test_cli_status_and_auth_check_never_expose_tokens() -> None:
-  import os
-  import subprocess
-
   env = dict(os.environ)
   env["GOOGLE_CLOUD_PROJECT"] = "customer-cli-proj"
   env["GOOGLE_OAUTH_ACCESS_TOKEN"] = "mock_cli_bearer_do_not_print"
@@ -682,6 +685,7 @@ def test_auto_routing_prompt_matrix_and_telemetry_logs(
     dispatched.append((conv_id, model_enum, thinking_level))
     return True
 
+  monkeypatch.setattr(router_hook, "_verify_cascade_ownership", lambda _cid: True)
   monkeypatch.setattr(router_hook, "_spawn_redispatch", fake_spawn)
 
   def fake_decision(call_args: dict[str, Any], _cfg: Any) -> dict[str, Any]:
@@ -819,7 +823,9 @@ def test_auto_routing_prompt_matrix_and_telemetry_logs(
       config_path=cfg_path,
       route_fn=route_with_mock,
   )
-  assert sub_out == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
+  assert sub_out["decision"] == "allow"
+  assert sub_out["overwrite"] == {"Model": "flash_lite"}
+  assert "Routed with Intent" in sub_out["reason"]
 
   rows = [
       json.loads(line)
@@ -870,6 +876,7 @@ def test_auto_switch_prevents_multi_step_loop(
     redispatch_calls.append((conv_id, model_enum, thinking_level))
     return True
 
+  monkeypatch.setattr(router_hook, "_verify_cascade_ownership", lambda _cid: True)
   monkeypatch.setattr(router_hook, "_spawn_redispatch", fake_redispatch)
 
   hook_payload = {
@@ -950,6 +957,463 @@ def test_verbosity_levels_and_routed_with_intent_aesthetics(
       {"verbosity": "verbose"}, config_path=cfg_path
   )
   assert saved["verbosity"] == "verbose"
+
+
+def test_private_dotenv_permissions_and_symlink_rejection(
+    tmp_path: pathlib.Path,
+) -> None:
+  """Verifies 0600 private .env loading, env precedence, 0644, and symlinks."""
+  # Missing .env returns empty dict
+  assert decisions_engine.load_private_dotenv(tmp_path / "missing.env") == {}
+
+  # Valid 0600 .env loads GEMINI_API_KEY and GOOGLE_CLOUD_PROJECT
+  dotenv_file = tmp_path / "private.env"
+  dotenv_file.write_text(
+      "# Private router credentials\n"
+      "GEMINI_API_KEY=\"mock_dotenv_key_0600\"\n"
+      "export GOOGLE_CLOUD_PROJECT='dotenv-project-01'\n"
+      "GEMINI_DECISIONS_HOOK_TIMEOUT_S=1.2\n",
+      encoding="utf-8",
+  )
+  dotenv_file.chmod(0o600)
+
+  loaded = decisions_engine.load_private_dotenv(dotenv_file)
+  assert loaded == {
+      "GEMINI_API_KEY": "mock_dotenv_key_0600",
+      "GOOGLE_CLOUD_PROJECT": "dotenv-project-01",
+      "GEMINI_DECISIONS_HOOK_TIMEOUT_S": "1.2",
+  }
+
+  # Process environ overrides .env while keeping fallback keys from .env
+  eff = decisions_engine.effective_environ(
+      {"GOOGLE_CLOUD_PROJECT": "process-override-proj"},
+      dotenv_path=dotenv_file,
+  )
+  assert eff["GEMINI_API_KEY"] == "mock_dotenv_key_0600"
+  assert eff["GOOGLE_CLOUD_PROJECT"] == "process-override-proj"
+
+  # Hermeticity: explicit environ with dotenv_path=None ignores user home .env
+  hermetic = decisions_engine.effective_environ({"GOOGLE_CLOUD_PROJECT": "p1"})
+  assert dict(hermetic) == {"GOOGLE_CLOUD_PROJECT": "p1"}
+
+  # load_settings wires effective_environ with dotenv_path
+  settings = decisions_engine.load_settings(
+      config_path=str(tmp_path / "none.json"),
+      environ={},
+      dotenv_path=dotenv_file,
+  )
+  assert settings.auth_mode == "api_key"
+  assert settings.project_id == "dotenv-project-01"
+
+  # Tightened hook_timeout_s kwarg accepted by route_prompt
+  routed = decisions_engine.route_prompt("ship it", hook_timeout_s=1.2)
+  assert routed["subagent_tier"] == "flash_lite"
+
+  # 0644 (group/world-readable) .env raises ConfigError
+  world_env = tmp_path / "world_readable.env"
+  world_env.write_text("GEMINI_API_KEY=exposed_val\n", encoding="utf-8")
+  world_env.chmod(0o644)
+  with pytest.raises(decisions_engine.ConfigError):
+    decisions_engine.load_private_dotenv(world_env)
+
+  # 0640 (group-readable) .env also raises ConfigError
+  group_env = tmp_path / "group_readable.env"
+  group_env.write_text("GEMINI_API_KEY=exposed_val\n", encoding="utf-8")
+  group_env.chmod(0o640)
+  with pytest.raises(decisions_engine.ConfigError):
+    decisions_engine.load_private_dotenv(group_env)
+
+  # Symlinked .env pointing to a valid 0600 file raises ConfigError
+  symlink_env = tmp_path / "symlink.env"
+  symlink_env.symlink_to(dotenv_file)
+  with pytest.raises(decisions_engine.ConfigError, match="symlink"):
+    decisions_engine.load_private_dotenv(symlink_env)
+
+
+def test_user_markdown_inline_banners_and_four_verbosity_levels(
+    tmp_path: pathlib.Path,
+) -> None:
+  """Verifies silent/compact/normal/verbose user_markdown banners + PreToolUse."""
+  cfg_path = tmp_path / "router_config.json"
+
+  # 1. silent: returns {} (0 steps injected) while still writing telemetry
+  router_hook.save_router_config(
+      {"mode": "advisor", "verbosity": "silent"}, config_path=cfg_path
+  )
+  out_silent = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "verb-silent-conv",
+          "invocationNum": 1,
+          "modelName": "auto",
+          "lastUserInput": "ship it",
+      },
+      state_dir=tmp_path,
+      config_path=cfg_path,
+  )
+  assert out_silent == {}
+
+  sub_silent = router_hook.handle_pre_tool_use(
+      {
+          "conversationId": "verb-silent-conv",
+          "lastUserInput": "run check",
+          "toolCall": {
+              "name": "invoke_subagent",
+              "args": {
+                  "TypeName": "research",
+                  "Role": "Checker",
+                  "Prompt": "ship it",
+                  "Model": "inherit",
+              },
+          },
+      },
+      state_dir=tmp_path,
+      config_path=cfg_path,
+  )
+  assert sub_silent == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
+  assert "reason" not in sub_silent
+
+  # 2. compact, normal, verbose: 0 model tokens + metadata.user_markdown populated
+  for level in ("compact", "normal", "verbose"):
+    router_hook.save_router_config(
+        {"mode": "advisor", "verbosity": level}, config_path=cfg_path
+    )
+    out = router_hook.handle_pre_invocation(
+        {
+            "conversationId": f"verb-{level}-conv",
+            "invocationNum": 1,
+            "modelName": "auto",
+            "lastUserInput": "use gemini pro to review distributed consensus",
+        },
+        state_dir=tmp_path,
+        config_path=cfg_path,
+    )
+    sys_msg = out["injectSteps"][0]["systemMessage"]
+    assert sys_msg["systemMessage"] == ""
+    user_md = sys_msg["metadata"]["user_markdown"]
+    assert "routed with intent" in user_md.lower()
+    if level == "compact":
+      assert "Routed with Intent" in user_md
+      assert "╭" not in user_md
+    elif level == "normal":
+      assert "Rationale" in user_md
+      assert "Thread Lock" not in user_md
+    elif level == "verbose":
+      assert "Thread Lock" in user_md
+
+    sub_out = router_hook.handle_pre_tool_use(
+        {
+            "conversationId": f"verb-{level}-sub",
+            "lastUserInput": "delegate check",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Checker",
+                    "Prompt": "ship it",
+                    "Model": "inherit",
+                },
+            },
+        },
+        state_dir=tmp_path,
+        config_path=cfg_path,
+    )
+    assert sub_out["decision"] == "allow"
+    assert sub_out["overwrite"] == {"Model": "flash_lite"}
+    assert "Routed with Intent" in sub_out["reason"]
+
+  # Verify silent PreInvocation still wrote telemetry alongside the other levels
+  rows = [
+      json.loads(line)
+      for line in (tmp_path / "telemetry.jsonl")
+      .read_text(encoding="utf-8")
+      .splitlines()
+      if line.strip()
+  ]
+  pre_events = [r for r in rows if r["event"] == "PreInvocation"]
+  assert len(pre_events) == 4
+  assert pre_events[0]["prompt"] == "ship it"
+
+
+def test_advisor_deduplicates_multi_step_tool_loops(
+    tmp_path: pathlib.Path,
+) -> None:
+  """Ensures advisor mode scores once per user turn and skips tool-loop steps."""
+  cfg_path = tmp_path / "router_config.json"
+  router_hook.save_router_config(
+      {"mode": "advisor", "verbosity": "normal"}, config_path=cfg_path
+  )
+
+  route_calls: list[str] = []
+
+  def counting_route(prompt: str, **kwargs: Any) -> dict[str, Any]:
+    route_calls.append(prompt)
+    return decisions_engine.route_prompt(prompt, **kwargs)
+
+  turn1_payload = {
+      "conversationId": "advisor-dedup-conv",
+      "invocationNum": 1,
+      "modelName": "auto",
+      "lastUserInput": "ship it",
+  }
+
+  step1 = router_hook.handle_pre_invocation(
+      turn1_payload,
+      state_dir=tmp_path,
+      config_path=cfg_path,
+      route_fn=counting_route,
+  )
+  assert "injectSteps" in step1
+  assert (
+      "routed with intent"
+      in step1["injectSteps"][0]["systemMessage"]["metadata"][
+          "user_markdown"
+      ].lower()
+  )
+  assert len(route_calls) == 1
+
+  step2 = router_hook.handle_pre_invocation(
+      turn1_payload,
+      state_dir=tmp_path,
+      config_path=cfg_path,
+      route_fn=counting_route,
+  )
+  assert step2 == {}
+  assert len(route_calls) == 1
+
+  step3 = router_hook.handle_pre_invocation(
+      turn1_payload,
+      state_dir=tmp_path,
+      config_path=cfg_path,
+      route_fn=counting_route,
+  )
+  assert step3 == {}
+  assert len(route_calls) == 1
+
+  # Sending a new lastUserInput on Turn 2 scores again and injects a fresh banner
+  turn2_payload = {
+      "conversationId": "advisor-dedup-conv",
+      "invocationNum": 2,
+      "modelName": "auto",
+      "lastUserInput": "use gemini pro to audit this consensus protocol",
+  }
+  turn2_step1 = router_hook.handle_pre_invocation(
+      turn2_payload,
+      state_dir=tmp_path,
+      config_path=cfg_path,
+      route_fn=counting_route,
+  )
+  assert "injectSteps" in turn2_step1
+  assert len(route_calls) == 2
+
+
+def test_auto_switch_preflight_falls_back_to_advisor_when_cli_unowned(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Verifies auto_switch never terminates when GetCascadeTrajectory is unowned."""
+  # Unit check on _verify_cascade_ownership RPC responses
+  monkeypatch.setattr(router_hook, "_ls_rpc", lambda *_a, **_k: None)
+  assert router_hook._verify_cascade_ownership("conv-none") is False
+
+  monkeypatch.setattr(
+      router_hook, "_ls_rpc", lambda *_a, **_k: {"error": "not_found"}
+  )
+  assert router_hook._verify_cascade_ownership("conv-err") is False
+
+  monkeypatch.setattr(
+      router_hook,
+      "_ls_rpc",
+      lambda *_a, **_k: {"status": "CASCADE_RUN_STATUS_RUNNING"},
+  )
+  assert router_hook._verify_cascade_ownership("conv-owned") is True
+
+  # Integration check: unowned CLI conversation falls back to inline advisor banner
+  cfg_path = tmp_path / "router_config.json"
+  router_hook.save_router_config(
+      {"mode": "auto_switch", "verbosity": "normal", "min_confidence": 0.45},
+      config_path=cfg_path,
+  )
+  monkeypatch.setattr(
+      router_hook, "_verify_cascade_ownership", lambda _cid: False
+  )
+  spawned: list[str] = []
+  monkeypatch.setattr(
+      router_hook,
+      "_spawn_redispatch",
+      lambda conv_id, *_a, **_k: spawned.append(conv_id) or True,
+  )
+
+  out = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "cli-ephemeral-ls-conv",
+          "invocationNum": 1,
+          "modelName": "auto",
+          "lastUserInput": "use gemini pro to design a distributed lock manager",
+      },
+      state_dir=tmp_path,
+      config_path=cfg_path,
+  )
+  assert "terminationBehavior" not in out
+  assert spawned == []
+  sys_msg = out["injectSteps"][0]["systemMessage"]
+  assert sys_msg["systemMessage"] == ""
+  assert "routed with intent" in sys_msg["metadata"]["user_markdown"].lower()
+  assert sys_msg["renderInfo"]["title"].startswith("Recommended:")
+
+  rows = [
+      json.loads(line)
+      for line in (tmp_path / "telemetry.jsonl")
+      .read_text(encoding="utf-8")
+      .splitlines()
+      if line.strip()
+  ]
+  assert len(rows) == 1
+  assert rows[0]["mode"] == "auto_switch"
+  assert rows[0]["did_auto_switch"] is False
+  assert rows[0]["auto_switch_fallback"] == "cascade_unowned"
+
+
+def test_configure_router_mcp_tool_and_cli_commands(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Verifies configure_router MCP tool plus auth-setup and watch --once CLI."""
+  cfg_path = tmp_path / ".config" / "gemini-decisions-router" / "router_config.json"
+  monkeypatch.setenv("HOME", str(tmp_path))
+  monkeypatch.setattr(router_hook, "default_router_config_path", lambda: cfg_path)
+
+  srv = mcp_server.McpServer()
+  list_resp = json.loads(
+      srv.handle_line(
+          json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode(
+              "utf-8"
+          )
+      ).decode("utf-8")
+  )
+  assert {t["name"] for t in list_resp["result"]["tools"]} == {
+      "create_decision",
+      "route_prompt",
+      "list_models",
+      "configure_router",
+  }
+
+  cfg_resp = json.loads(
+      srv.handle_line(
+          json.dumps({
+              "jsonrpc": "2.0",
+              "id": 2,
+              "method": "tools/call",
+              "params": {
+                  "name": "configure_router",
+                  "arguments": {
+                      "verbosity": "compact",
+                      "tier_models": {"pro": "claude-opus-4-6"},
+                  },
+              },
+          }).encode("utf-8")
+      ).decode("utf-8")
+  )
+  assert cfg_resp["result"]["isError"] is False
+  saved_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+  assert saved_disk["verbosity"] == "compact"
+  assert saved_disk["tier_models"]["pro"] == "claude-opus-4-6"
+
+  # Test auth-setup CLI writes 0600 .env without leaking secrets to stdout/stderr
+  dotenv_out = tmp_path / ".config" / "gemini-decisions-router" / ".env"
+  env = dict(os.environ)
+  env["HOME"] = str(tmp_path)
+  env["GEMINI_API_KEY"] = "mock_auth_setup_secret_999"
+  env["GOOGLE_CLOUD_PROJECT"] = "setup-cli-proj-42"
+
+  setup_proc = subprocess.run(
+      [
+          sys.executable,
+          "-B",
+          str(REPO_ROOT / "router_hook.py"),
+          "auth-setup",
+          "--from-env",
+          "--dotenv-path",
+          str(dotenv_out),
+      ],
+      env=env,
+      capture_output=True,
+      text=True,
+      timeout=8.0,
+      check=True,
+  )
+  assert "mock_auth_setup_secret_999" not in setup_proc.stdout
+  assert "mock_auth_setup_secret_999" not in setup_proc.stderr
+  setup_json = json.loads(setup_proc.stdout)
+  assert setup_json["ok"] is True
+  assert stat.S_IMODE(dotenv_out.stat().st_mode) == 0o600
+  parsed_dotenv = decisions_engine.load_private_dotenv(dotenv_out)
+  assert parsed_dotenv["GEMINI_API_KEY"] == "mock_auth_setup_secret_999"
+  assert parsed_dotenv["GOOGLE_CLOUD_PROJECT"] == "setup-cli-proj-42"
+
+  # Test watch --once CLI prints live monitor header and recent telemetry entries
+  cache_dir = tmp_path / ".cache" / "gemini-decisions-router"
+  cache_dir.mkdir(parents=True, exist_ok=True)
+  (cache_dir / "telemetry.jsonl").write_text(
+      json.dumps({
+          "ts": "2026-01-01T00:00:00+00:00",
+          "event": "PreInvocation",
+          "prompt": "Refactor pagination handler",
+          "mode": "advisor",
+          "did_auto_switch": False,
+          "current_model": "auto",
+          "recommended_model_id": "gemini-3-flash",
+          "subagent_tier": "flash",
+          "thinking_label": "Medium",
+          "task_class": "coding_edit",
+          "confidence": 0.91,
+          "latency_ms": 185,
+          "backend": "gemini_api",
+      })
+      + "\n",
+      encoding="utf-8",
+  )
+  watch_proc = subprocess.run(
+      [
+          sys.executable,
+          "-B",
+          str(REPO_ROOT / "router_hook.py"),
+          "watch",
+          "--once",
+      ],
+      env=env,
+      capture_output=True,
+      text=True,
+      timeout=8.0,
+      check=True,
+  )
+  assert "ROUTED WITH INTENT | LIVE MONITOR" in watch_proc.stdout
+  assert "gemini-3-flash" in watch_proc.stdout
+
+  # Test install.sh into isolated directories + generated agy-router wrapper
+  plugins_dir = tmp_path / "plugins"
+  bin_dir = tmp_path / "bin"
+  install_env = dict(env)
+  install_env["ANTIGRAVITY_PLUGINS_DIR"] = str(plugins_dir)
+  install_env["BIN_DIR"] = str(bin_dir)
+  subprocess.run(
+      ["bash", str(REPO_ROOT / "install.sh")],
+      env=install_env,
+      capture_output=True,
+      text=True,
+      timeout=15.0,
+      check=True,
+  )
+  wrapper = bin_dir / "agy-router"
+  assert wrapper.is_file()
+  assert os.access(wrapper, os.X_OK)
+  status_proc = subprocess.run(
+      [str(wrapper), "status"],
+      env=install_env,
+      capture_output=True,
+      text=True,
+      timeout=8.0,
+      check=True,
+  )
+  status_json = json.loads(status_proc.stdout)
+  assert status_json["router_config"]["verbosity"] == "compact"
 
 
 def test_docs_contain_no_em_or_en_dashes() -> None:

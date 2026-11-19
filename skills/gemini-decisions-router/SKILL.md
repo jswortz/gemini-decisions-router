@@ -1,61 +1,80 @@
 ---
 name: gemini-decisions-router
-description: Route prompts and subagents or ask calibrated yes/no (`noul`), multiple-choice (`choice`), and rubric (`score`) questions using the Gemini Decisions API (`gemini-decision-1`) via keyless Google Cloud Application Default Credentials (ADC) or `GEMINI_API_KEY`. Use when classifying tasks, gating tool actions on confidence, scoring documents against rubrics, or configuring the Gemini Decisions Router mode (`advisor`, `auto_switch`, `off`) in Antigravity.
+description: Route prompts and subagents or ask calibrated yes/no (`noul`), multiple-choice (`choice`), and rubric (`score`) questions using the Gemini Decisions API (`gemini-decision-1`) via keyless Google Cloud Application Default Credentials (ADC) or `GEMINI_API_KEY`. Use when classifying tasks, gating tool actions on confidence, scoring documents against rubrics, listing or customizing target models, or configuring router mode (`advisor`, `auto_switch`, `off`) and verbosity (`silent`, `compact`, `normal`, `verbose`) in Antigravity.
 ---
 
 # Gemini Decisions Router
 
-This plugin connects Antigravity to the Gemini Decisions API (`gemini-decision-1`) for calibrated, zero-output-token classification and automatic model routing.
+This plugin connects the Antigravity Desktop App and `agy` CLI to the Gemini Decisions API (`gemini-decision-1`) for calibrated, zero-output-token classification and automatic model routing.
 
-## MCP Tools
+## MCP Tools (`gemini-decisions-router_decisions`)
 
-The bundled MCP server registers three tools under the `gemini-decisions-router_decisions` namespace:
-
-1. `create_decision`: Evaluates shared text or local files once across up to 64 independent questions of three types:
+1. `create_decision`: Evaluates shared `input` (`text` or allowlisted `file` items) once across 1 to 64 independent questions:
    - `noul`: Binary yes/no question returning calibrated `P(yes)` in `[0.01, 0.99]`, boolean `value`, and `confidence` in `[0, 1]`.
    - `choice`: Discrete multiple-choice map (2 to 255 options) returning `choice`, `confidence`, and normalized `probabilities`.
    - `score`: Ordered rubric array (2 to 255 levels, index `0..N-1`) returning expected `score`, modal `level`, `confidence`, and per-level `probabilities`.
-2. `route_prompt`: Classifies a prompt or subagent task using Tier 0 (`<1 ms`) fast rules plus a single-pass `create_decision` call, returning `recommended_tier` (`flash_lite`, `flash`, `pro`), `recommended_model_id`, `thinking_level`, and `confidence`.
-3. `list_models`: Lists all available target models, their Antigravity model enums, default thinking levels, and the active `tier_models` configuration.
+2. `route_prompt`: Classifies a prompt or subagent task using Tier 0 (`<1 ms`) fast rules plus a single-pass `create_decision` call, returning `recommended_tier` (`flash_lite`, `flash`, `pro`), `recommended_model_id`, `thinking_level` (`1..4`), `confidence`, and `probabilities`.
+3. `list_models`: Lists all built-in and custom target models, their Antigravity model enums, default thinking levels, and active `tier_models` (`flash_lite`, `flash`, `pro`).
+4. `configure_router`: Updates persistent settings in `~/.config/gemini-decisions-router/router_config.json` and returns the updated config plus `active_tier_models`. Supported fields:
+   - `mode`: `"advisor"` | `"auto_switch"` | `"off"`
+   - `verbosity`: `"silent"` | `"compact"` | `"normal"` | `"verbose"`
+   - `min_confidence`: number in `[0.0, 1.0]`
+   - `enable_subagent_routing`: boolean
+   - `tier_models`: optional object mapping `flash_lite`, `flash`, and/or `pro` to target model IDs
 
-## Lifecycle Hooks
+## Lifecycle Hooks & Runtime Behavior
 
-- `PreInvocation`: Scores each explicit user turn, preserves Turn 2+ thread floors so short follow-ups (`"yes"`, `"ship it"`) never downgrade an active `pro` session, and renders a zero-token routing summary card in the UI.
-- `PreToolUse` (`invoke_subagent`): When a subagent is invoked with `Model` unset or `"inherit"`, scores the subagent task and sets `Model` to `flash_lite`, `flash`, or `pro`.
+- `PreInvocation`:
+  - Scores Step 1 of each explicit user turn (`1.5s` default hook HTTP deadline via `GEMINI_DECISIONS_HOOK_TIMEOUT_S`), enforces Turn 2+ asymmetric thread floors so short follow-ups (`"yes"`, `"ship it"`) never downgrade an active `pro` thread, and deduplicates multi-step tool loops (`<1 ms` on Steps 2..N).
+  - Emits zero-token inline `"✦ Routed with Intent"` banners via `systemMessage.metadata.user_markdown` (`"systemMessage": ""`) across both the Antigravity Desktop App and `agy` CLI according to `verbosity` (`silent`, `compact`, `normal`, `verbose`).
+  - In `auto_switch` mode, runs a `GetCascadeTrajectory` ownership pre-flight check before terminating a turn; if the Language Server does not own the cascade (such as in `agy` CLI), it automatically falls back to `advisor` mode so turns never hang.
+- `PreToolUse` (`invoke_subagent`): When `Model` is unset or `"inherit"`, assigns `flash_lite`, `flash`, or `pro` and includes a `"✦ Routed with Intent"` tool `reason` notice (omitted when `verbosity` is `"silent"`).
 
-## CLI Commands
+## `agy-router` CLI Reference
 
-Run these commands to verify credentials, inspect telemetry, or change router behavior:
+`./install.sh` installs `~/.local/bin/agy-router` (fallback: `python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py <subcommand>`):
 
 ```bash
-# Verify ADC or API key setup (pass --live to send a live probe)
-python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py auth-check --live
+# Write a 0600 ~/.config/gemini-decisions-router/.env file for Desktop App + agy CLI
+agy-router auth-setup --from-env
+printf '%s\n' 'your-ai-studio-api-key' | agy-router auth-setup --api-key-stdin
+agy-router auth-setup --project your-gcp-project-id --auth-mode gemini_adc
 
-# Check active authentication mode, GCP project, and router status
-python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py status
+# Verify ADC or API key resolution and run a live 1-question probe
+agy-router auth-check --live
 
-# Test routing on any prompt
-python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py route \
+# Inspect router config, active backend, LS detection, and target models
+agy-router status
+
+# Test prompt routing with formatted "Routed with Intent" output
+agy-router route \
   --prompt "Design a multi-region Cloud Spanner schema with conflict-free failover" \
-  --no-fast-rules
+  --no-fast-rules \
+  --pretty
 
-# Switch mode: advisor (default), auto_switch, or off
-python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py set-mode advisor
-python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py set-mode auto_switch
+# Stream live routing events or print current tail once
+agy-router watch
+agy-router watch --verbosity verbose --once
 
-# Inspect all available target models and active tier assignments
-python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py list-models
+# Inspect historical routing telemetry and average latency
+agy-router stats
+agy-router stats --verbosity compact
+agy-router stats --verbosity verbose --limit 100
+agy-router stats --json
 
-# Customize target models per tier (or pass --reset for defaults)
-python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py set-models --pro claude-sonnet-4-6
+# Configure operating mode and inline verbosity preset
+agy-router set-mode advisor
+agy-router set-mode auto_switch --min-confidence 0.55
+agy-router set-verbosity compact   # silent | compact | normal | verbose
 
-# Inspect recent routing telemetry and average latency
-python3 ~/.gemini/config/plugins/gemini-decisions-router/router_hook.py stats
+# List or customize target models mapped to flash_lite, flash, and pro
+agy-router list-models
+agy-router set-models --flash-lite gemini-3.1-flash-lite --flash gemini-3-flash --pro claude-opus-4-6
+agy-router set-models --reset
 ```
 
-## Authentication Rules
+## Authentication & Safety Rules
 
-- **Keyless Gemini API via ADC (`gemini_adc`, default when no API key is set):** Uses OAuth2 Bearer tokens from Application Default Credentials plus `x-goog-user-project: $GOOGLE_CLOUD_PROJECT`. On developer workstations, include `https://www.googleapis.com/auth/generative-language.retriever` when running `gcloud auth application-default login`.
-- **Keyless Vertex AI via ADC (`vertex_adc`, enabled when `GOOGLE_GENAI_USE_VERTEXAI=true`):** Uses standard `https://www.googleapis.com/auth/cloud-platform` ADC against `aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{location}/decisions`.
-- **API Key Fallback (`api_key`):** Export `GEMINI_API_KEY` in the shell environment. Never place secrets or tokens inside `config.json`.
-- **Model Dropdown Rule:** Never select `gemini-decision-1` as an interactive chat model in `settings.json`. Decision models emit zero output tokens on `GenerateContent` and only answer `CreateDecision` calls.
+- **Private `.env` (`0600`):** `~/.config/gemini-decisions-router/.env` must be a regular file with `0600` permissions; symlinks and group/world-readable files raise `ConfigError`. Process environment variables override `.env`. Never put secrets in `config.json` or `router_config.json`.
+- **Keyless ADC (`gemini_adc` / `vertex_adc`):** Default when no API key is set. Workstation `gemini_adc` requires `https://www.googleapis.com/auth/generative-language.retriever` in `gcloud auth application-default login`; `vertex_adc` (`GOOGLE_GENAI_USE_VERTEXAI=true`) uses `cloud-platform`.
+- **Model Dropdown Rule:** Never select `gemini-decision-1` as an interactive chat model in `settings.json`; it emits zero text tokens on `GenerateContent` and only answers `CreateDecision` requests.

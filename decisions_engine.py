@@ -18,6 +18,7 @@ import dataclasses
 import json
 import math
 import os
+import pathlib
 import random
 import re
 import shutil
@@ -208,6 +209,112 @@ def _default_config_path() -> str:
   return os.path.join(home, ".config", "gemini-decisions-router", "config.json")
 
 
+def default_private_dotenv_path() -> pathlib.Path:
+  """Returns the default user-private 0600 .env path for GUI and CLI sessions."""
+  return pathlib.Path.home() / ".config" / "gemini-decisions-router" / ".env"
+
+
+def load_private_dotenv(
+    dotenv_path: str | os.PathLike[str] | None = None,
+) -> dict[str, str]:
+  """Loads KEY=VALUE pairs from a regular 0600 .env file (refusing symlinks)."""
+  p = (
+      pathlib.Path(dotenv_path).expanduser()
+      if dotenv_path is not None
+      else default_private_dotenv_path()
+  )
+  try:
+    st = os.lstat(p)
+  except FileNotFoundError:
+    return {}
+  except OSError as e:
+    if dotenv_path is None:
+      return {}
+    raise ConfigError(
+        f"Cannot stat .env file {p}: {e.strerror or 'error'}"
+    ) from None
+
+  if stat.S_ISLNK(st.st_mode):
+    raise ConfigError("Refusing to load symlinked .env file")
+  if not stat.S_ISREG(st.st_mode) or (st.st_mode & 0o077) != 0:
+    raise ConfigError(
+        "Refusing to load .env with group or world permissions; chmod 600"
+        " required"
+    )
+
+  flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+  try:
+    fd = os.open(p, flags)
+  except OSError as e:
+    raise ConfigError(
+        f"Cannot open .env file {p}: {e.strerror or 'error'}"
+    ) from None
+
+  try:
+    fd_st = os.fstat(fd)
+    if not stat.S_ISREG(fd_st.st_mode) or (fd_st.st_mode & 0o077) != 0:
+      raise ConfigError(
+          "Refusing to load .env with group or world permissions; chmod 600"
+          " required"
+      )
+    chunks: list[bytes] = []
+    total = 0
+    while total <= 65536:
+      chunk = os.read(fd, 16384)
+      if not chunk:
+        break
+      chunks.append(chunk)
+      total += len(chunk)
+    if total > 65536:
+      raise ConfigError(".env file exceeds 64 KiB safety limit")
+    raw_bytes = b"".join(chunks)
+  finally:
+    os.close(fd)
+
+  try:
+    text = raw_bytes.decode("utf-8").lstrip("\ufeff")
+  except UnicodeDecodeError:
+    raise ConfigError(".env file is not valid UTF-8") from None
+
+  parsed: dict[str, str] = {}
+  for raw_line in text.splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+      continue
+    if line.startswith(("export ", "export\t")):
+      line = line[6:].strip()
+    if "=" not in line:
+      continue
+    key, raw_val = line.split("=", 1)
+    key = key.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+      continue
+    val = raw_val.strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+      val = val[1:-1]
+    elif val and val[0] in ("'", '"'):
+      close_idx = val.find(val[0], 1)
+      if close_idx != -1 and val[close_idx + 1 :].strip().startswith("#"):
+        val = val[1:close_idx]
+    elif " #" in val or "\t#" in val:
+      val = re.split(r"\s+#", val, maxsplit=1)[0].rstrip()
+    parsed[key] = val
+  return parsed
+
+
+def effective_environ(
+    environ: Mapping[str, str] | None = None,
+    *,
+    dotenv_path: str | os.PathLike[str] | None = None,
+) -> Mapping[str, str]:
+  """Returns effective env mapping, merging private 0600 .env under process env."""
+  if environ is not None and dotenv_path is None:
+    return environ
+  file_env = load_private_dotenv(dotenv_path)
+  base_env = os.environ if environ is None else environ
+  return {**file_env, **base_env}
+
+
 def _create_tls_context() -> ssl.SSLContext:
   ctx = ssl.create_default_context()
   ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -231,9 +338,10 @@ def load_settings(
     *,
     config_path: str | None = None,
     environ: Mapping[str, str] | None = None,
+    dotenv_path: str | os.PathLike[str] | None = None,
 ) -> Settings:
-  """Loads and validates settings from optional config.json + env overrides."""
-  env = os.environ if environ is None else environ
+  """Loads and validates settings from optional config.json + .env + env."""
+  env = effective_environ(environ, dotenv_path=dotenv_path)
   cfg_path = (
       config_path
       or env.get("GEMINI_DECISIONS_CONFIG")
@@ -678,9 +786,10 @@ def resolve_adc_token(
     *,
     project_hint: str = "",
     environ: Mapping[str, str] | None = None,
+    dotenv_path: str | os.PathLike[str] | None = None,
 ) -> AdcToken:
   """Resolves an OAuth2 ADC Bearer token without requiring any API key."""
-  env = os.environ if environ is None else environ
+  env = effective_environ(environ, dotenv_path=dotenv_path)
 
   env_tok = str(env.get("GOOGLE_OAUTH_ACCESS_TOKEN") or "").strip()
   if env_tok:
@@ -1327,10 +1436,11 @@ def create_decision(
     settings: Settings | None = None,
     *,
     environ: Mapping[str, str] | None = None,
+    dotenv_path: str | os.PathLike[str] | None = None,
     token_provider: Callable[[tuple[str, ...]], AdcToken] | None = None,
 ) -> dict[str, Any]:
   """Evaluates calibrated `noul`, `choice`, and `score` questions in one pass."""
-  env = os.environ if environ is None else environ
+  env = effective_environ(environ, dotenv_path=dotenv_path)
   cfg = settings or load_settings(environ=env)
   api_key = ""
   bearer_token = ""
@@ -1395,7 +1505,7 @@ def create_decision(
     last_err: DecisionError | None = None
     for attempt in range(2):
       rem = cfg.timeout_s - (time.monotonic() - t0)
-      if rem < 0.5:
+      if rem < (0.2 if attempt == 0 else 0.5):
         break
       try:
         res = _call_decisions_http(
@@ -2019,14 +2129,16 @@ def route_prompt(
     enable_fast_rules: bool = True,
     ignore_cooldown: bool = False,
     cooldown_file: str | None = None,
+    hook_timeout_s: float | None = None,
     settings: Settings | None = None,
     environ: Mapping[str, str] | None = None,
+    dotenv_path: str | os.PathLike[str] | None = None,
     decision_fn: Callable[..., dict[str, Any]] | None = None,
     tier_models: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
   """Scores a prompt via Tier 0 fast rules + Tier 1 Gemini Decisions API."""
   del current_model  # Reserved for future catalog-aware cost comparison
-  env = os.environ if environ is None else environ
+  env = effective_environ(environ, dotenv_path=dotenv_path)
   resolved_models = resolve_tier_models(tier_models, environ=env)
   text = (prompt or "").strip()
   if not text:
@@ -2071,7 +2183,22 @@ def route_prompt(
       cfg = settings or load_settings(environ=env)
       if not ignore_cooldown and is_api_on_cooldown(cooldown_file):
         raise UnavailableError("Decisions API on temporary 45s cooldown")
-      budget = 10.0 if ignore_cooldown else min(cfg.timeout_s, 3.8)
+      if ignore_cooldown:
+        budget = 10.0
+      else:
+        raw_hook_budget: Any = (
+            hook_timeout_s
+            if hook_timeout_s is not None
+            else (env.get("GEMINI_DECISIONS_HOOK_TIMEOUT_S") or 1.5)
+        )
+        try:
+          parsed_hook_budget = float(raw_hook_budget)
+        except (TypeError, ValueError):
+          parsed_hook_budget = 1.5
+        if not math.isfinite(parsed_hook_budget):
+          parsed_hook_budget = 1.5
+        hook_budget = max(0.3, min(8.0, parsed_hook_budget))
+        budget = min(cfg.timeout_s, hook_budget)
       router_cfg = dataclasses.replace(cfg, timeout_s=budget)
       try:
         dec = create_decision(call_args, router_cfg, environ=env)

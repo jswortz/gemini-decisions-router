@@ -4,28 +4,36 @@
 Hooks supported:
   - `pre-invocation`: Scores incoming user turns via Tier 0 (<1 ms) fast rules
     and Tier 1 Gemini Decisions API, enforces asymmetric Turn 2+ thread floors,
-    and renders a zero-token collapsible routing badge (`renderInfo`).
+    deduplicates multi-step tool loops, verifies cascade ownership before
+    `auto_switch`, and renders a zero-token inline routing banner
+    (`metadata.user_markdown` + `renderInfo`).
   - `pre-tool-use`: Intercepts `invoke_subagent` calls when `Model` is unset or
     `"inherit"` and assigns the calibrated `flash_lite`, `flash`, or `pro` tier.
 
 CLI commands:
+  - `auth-setup [--from-env] [--api-key-stdin] [--project ID] [--auth-mode MODE]`
   - `auth-check [--live]`
   - `route --prompt "..."`
   - `status`
+  - `list-models`
+  - `set-models [--flash-lite ID] [--flash ID] [--pro ID]`
   - `set-mode <advisor|auto_switch|off>`
-  - `stats`
+  - `set-verbosity <silent|compact|normal|verbose>`
+  - `watch [--verbosity LEVEL] [--interval SEC] [--once]`
+  - `stats [--verbosity LEVEL] [--json]`
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -37,15 +45,27 @@ import decisions_engine  # noqa: E402
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _SAFE_ENUM_RE = re.compile(r"^[A-Z0-9_]{3,96}$")
+_ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 MODEL_ENUMS: dict[str, str] = dict(decisions_engine.MODEL_ENUMS)
 
-VALID_VERBOSITY_LEVELS = ("compact", "normal", "verbose")
+VALID_VERBOSITY_LEVELS = ("silent", "compact", "normal", "verbose")
+
+_RECOGNIZED_DOTENV_KEYS = (
+    "GEMINI_API_KEY",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GEMINI_DECISIONS_AUTH_MODE",
+    "GEMINI_DECISIONS_MODEL",
+    "GEMINI_DECISIONS_HOOK_TIMEOUT_S",
+)
 
 DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "mode": "advisor",  # "advisor" | "auto_switch" | "off"
-    "verbosity": "normal",  # "compact" | "normal" | "verbose"
+    "verbosity": "normal",  # "silent" | "compact" | "normal" | "verbose"
     "min_confidence": 0.45,
+    "hook_timeout_s": 1.5,
     "enable_fast_rules": True,
     "enable_subagent_routing": True,
     "tier_models": dict(decisions_engine.DEFAULT_TIER_MODELS),
@@ -54,10 +74,16 @@ DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
 
 
 def default_state_dir() -> pathlib.Path:
+  env_dir = os.environ.get("GEMINI_DECISIONS_STATE_DIR", "").strip()
+  if env_dir:
+    return pathlib.Path(env_dir)
   return pathlib.Path.home() / ".cache" / "gemini-decisions-router"
 
 
 def default_router_config_path() -> pathlib.Path:
+  env_cfg = os.environ.get("GEMINI_DECISIONS_ROUTER_CONFIG", "").strip()
+  if env_cfg:
+    return pathlib.Path(env_cfg)
   return (
       pathlib.Path.home()
       / ".config"
@@ -66,8 +92,29 @@ def default_router_config_path() -> pathlib.Path:
   )
 
 
+def _default_dotenv_path() -> pathlib.Path:
+  fn = getattr(decisions_engine, "default_private_dotenv_path", None)
+  if callable(fn):
+    return pathlib.Path(fn())
+  return pathlib.Path.home() / ".config" / "gemini-decisions-router" / ".env"
+
+
+def _effective_environ() -> Mapping[str, str]:
+  fn = getattr(decisions_engine, "effective_environ", None)
+  if callable(fn):
+    try:
+      return fn()
+    except decisions_engine.DecisionError:
+      return os.environ
+  return os.environ
+
+
 def _ensure_private_dir(path: pathlib.Path) -> None:
   path.mkdir(parents=True, exist_ok=True, mode=0o700)
+  try:
+    os.chmod(path, 0o700)
+  except OSError:
+    pass
 
 
 def safe_state_path(
@@ -110,6 +157,13 @@ def load_router_config(
                 if str(mid).strip()
                 and _SAFE_ENUM_RE.fullmatch(str(enum_val).strip())
             }
+          elif k == "hook_timeout_s":
+            try:
+              cfg["hook_timeout_s"] = max(
+                  0.3, min(8.0, float(loaded["hook_timeout_s"]))
+              )
+            except (TypeError, ValueError):
+              pass
           else:
             cfg[k] = loaded[k]
     except (OSError, ValueError):
@@ -123,6 +177,12 @@ def load_router_config(
     cfg["verbosity"] = env_verb
   if str(cfg.get("verbosity") or "").lower() not in VALID_VERBOSITY_LEVELS:
     cfg["verbosity"] = "normal"
+  env_timeout = os.environ.get("GEMINI_DECISIONS_HOOK_TIMEOUT_S", "").strip()
+  if env_timeout:
+    try:
+      cfg["hook_timeout_s"] = max(0.3, min(8.0, float(env_timeout)))
+    except ValueError:
+      pass
   return cfg
 
 
@@ -141,7 +201,18 @@ def save_router_config(
   p = config_path or default_router_config_path()
   _ensure_private_dir(p.parent)
   cfg = load_router_config(p)
-  cfg.update(updates)
+  for key, val in updates.items():
+    if key == "tier_models" and isinstance(val, Mapping):
+      merged = dict(
+          cfg.get("tier_models") or decisions_engine.DEFAULT_TIER_MODELS
+      )
+      for tier_key in ("flash_lite", "flash", "pro"):
+        raw_model = val.get(tier_key)
+        if isinstance(raw_model, str) and raw_model.strip():
+          merged[tier_key] = raw_model.strip()
+      cfg["tier_models"] = merged
+    else:
+      cfg[key] = val
   p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
   return cfg
 
@@ -178,6 +249,18 @@ def _append_telemetry(state_dir: pathlib.Path, event: dict[str, Any]) -> None:
     log_file = state_dir / "telemetry.jsonl"
     with open(log_file, "a", encoding="utf-8") as f:
       f.write(json.dumps(event, ensure_ascii=False) + "\n")
+  except OSError:
+    pass
+
+
+def _log_redispatch_error(message: str) -> None:
+  try:
+    sdir = default_state_dir()
+    _ensure_private_dir(sdir)
+    log_file = sdir / "redispatch.log"
+    ts = datetime.now(timezone.utc).isoformat()
+    with open(log_file, "a", encoding="utf-8") as f:
+      f.write(f"[{ts}] {message}\n")
   except OSError:
     pass
 
@@ -223,6 +306,20 @@ def _ls_rpc(
       return json.loads(resp.read(262144).decode("utf-8"))
   except (OSError, ValueError):
     return None
+
+
+def _verify_cascade_ownership(conversation_id: str) -> bool:
+  """Verifies the discovered Language Server owns `conversation_id`."""
+  if not conversation_id:
+    return False
+  resp = _ls_rpc(
+      "GetCascadeTrajectory", {"cascadeId": conversation_id}, timeout=0.4
+  )
+  if not isinstance(resp, dict):
+    return False
+  if "error" in resp:
+    return False
+  return "trajectory" in resp or "status" in resp
 
 
 def _spawn_redispatch(
@@ -298,6 +395,9 @@ def _format_intent_banner(
   arrow = ">>" if switched else "->"
   tag = "AUTO-SWITCHED" if switched else "ADVISOR"
 
+  if verbosity == "silent":
+    return ""
+
   if verbosity == "compact":
     return (
         f"✦ Routed with Intent {arrow} {model_id} [{thinking}]"
@@ -331,6 +431,13 @@ def _build_render_info(
   thinking = str(route["thinking_label"])
   latency = route["latency_ms"]
 
+  if verb == "silent":
+    return {
+        "titlePrefix": "✦ Routed with Intent",
+        "title": f"{action}: {model_id} [{thinking}] ({conf_pct}%)",
+        "markdown": "",
+    }
+
   if verb == "compact":
     title = f"{action}: {model_id} [{thinking}] ({conf_pct}% | {latency} ms)"
     markdown = (
@@ -349,6 +456,7 @@ def _build_render_info(
       route, current_model=current_model, switched=switched, verbosity=verb
   )
   lines = [
+      f"✦ **Routed with Intent** ({action}: `{model_id}` [{thinking}] · {conf_pct}%)",
       f"```text\n{banner}\n```",
       f"- **Active Dropdown Model**: `{current_model}`",
       (
@@ -394,6 +502,80 @@ def _build_render_info(
   }
 
 
+def _build_user_markdown(
+    route: dict[str, Any],
+    *,
+    current_model: str,
+    switched: bool,
+    verbosity: str = "normal",
+    render_info: dict[str, str] | None = None,
+) -> str:
+  """Builds universal zero-token inline markdown for App and agy CLI."""
+  verb = verbosity if verbosity in VALID_VERBOSITY_LEVELS else "normal"
+  if verb == "silent":
+    return ""
+  if verb == "compact":
+    conf_pct = int(round(float(route.get("confidence", 0.0)) * 100))
+    action = "Auto-Switched" if switched else "Recommended"
+    model_id = str(route["recommended_model_id"])
+    thinking = str(route["thinking_label"])
+    latency = route["latency_ms"]
+    return (
+        f"✦ **Routed with Intent** ({action}) -> `{model_id}`"
+        f" [{thinking}] · {conf_pct}% · `{route['backend']}` ({latency} ms)"
+    )
+  ri = (
+      render_info
+      if render_info is not None
+      else _build_render_info(
+          route,
+          current_model=current_model,
+          switched=switched,
+          verbosity=verb,
+      )
+  )
+  return ri.get("markdown", "")
+
+
+def _make_inject_steps(
+    render_info: dict[str, str],
+    user_md: str,
+    *,
+    verbosity: str = "normal",
+) -> dict[str, Any]:
+  """Constructs zero-model-token injectSteps payload across App and agy CLI."""
+  if verbosity == "silent" or not user_md:
+    return {}
+  return {
+      "injectSteps": [{
+          "systemMessage": {
+              "systemMessage": "",
+              "metadata": {"user_markdown": user_md},
+              "renderInfo": render_info,
+          }
+      }]
+  }
+
+
+def _call_route_fn(
+    route_fn: Callable[..., dict[str, Any]],
+    prompt: str,
+    *,
+    cfg: dict[str, Any],
+    **kwargs: Any,
+) -> dict[str, Any]:
+  """Calls `route_fn`, passing `hook_timeout_s` when calling engine directly."""
+  call_kwargs = dict(kwargs)
+  if route_fn is decisions_engine.route_prompt:
+    call_kwargs.setdefault("tier_models", cfg.get("tier_models"))
+    hook_timeout = float(cfg.get("hook_timeout_s", 1.5))
+    try:
+      return route_fn(prompt, hook_timeout_s=hook_timeout, **call_kwargs)
+    except TypeError:
+      return route_fn(prompt, **call_kwargs)
+  return route_fn(prompt, **call_kwargs)
+
+
 def handle_pre_invocation(
     hook_input: dict[str, Any],
     *,
@@ -422,33 +604,39 @@ def handle_pre_invocation(
   model_name = str(hook_input.get("modelName") or "auto").strip()
   raw_inv = hook_input.get("invocationNum")
   turn_num = max(1, int(raw_inv)) if isinstance(raw_inv, int) else 1
+  verbosity = str(cfg.get("verbosity") or "normal")
 
-  reroute_file = safe_state_path(sdir, conv_id, "reroute")
-  reroute_hit = _load_json_state(reroute_file, max_age_s=600.0)
   prompt_hash = hashlib.sha256(
       cleaned.encode("utf-8", "ignore")
   ).hexdigest()[:16]
+
+  reroute_file = safe_state_path(sdir, conv_id, "reroute")
+  reroute_hit = _load_json_state(reroute_file, max_age_s=600.0)
   if reroute_hit and reroute_hit.get("prompt_hash") == prompt_hash:
     if reroute_hit.get("rendered"):
       return {}
+    saved_ri = reroute_hit.get("render_info") or {}
+    saved_verb = str(reroute_hit.get("verbosity") or verbosity)
+    saved_md = str(
+        reroute_hit.get("user_markdown") or saved_ri.get("markdown") or ""
+    )
     _save_json_state(
         reroute_file,
         {
             "prompt_hash": prompt_hash,
-            "render_info": reroute_hit.get("render_info") or {},
+            "render_info": saved_ri,
+            "user_markdown": saved_md,
+            "verbosity": saved_verb,
             "rendered": True,
         },
     )
-    render_info = reroute_hit.get("render_info") or {}
-    if render_info:
-      return {
-          "injectSteps": [{
-              "systemMessage": {
-                  "systemMessage": "",
-                  "renderInfo": render_info,
-              }
-          }]
-      }
+    if saved_ri:
+      return _make_inject_steps(saved_ri, saved_md, verbosity=saved_verb)
+    return {}
+
+  seen_file = safe_state_path(sdir, conv_id, "seen_turn")
+  seen_hit = _load_json_state(seen_file, max_age_s=600.0)
+  if seen_hit and seen_hit.get("prompt_hash") == prompt_hash:
     return {}
 
   thread_file = safe_state_path(sdir, conv_id, "thread")
@@ -456,15 +644,15 @@ def handle_pre_invocation(
   if thread_state and turn_num == 1:
     turn_num = int(thread_state.get("turn_count_seen", 1)) + 1
 
-  route_kwargs: dict[str, Any] = {
-      "current_model": model_name,
-      "user_turn_count": turn_num,
-      "thread_state": thread_state,
-      "enable_fast_rules": bool(cfg.get("enable_fast_rules", True)),
-  }
-  if route_fn is decisions_engine.route_prompt:
-    route_kwargs["tier_models"] = cfg.get("tier_models")
-  route = route_fn(cleaned, **route_kwargs)
+  route = _call_route_fn(
+      route_fn,
+      cleaned,
+      cfg=cfg,
+      current_model=model_name,
+      user_turn_count=turn_num,
+      thread_state=thread_state,
+      enable_fast_rules=bool(cfg.get("enable_fast_rules", True)),
+  )
 
   min_conf = float(cfg.get("min_confidence", 0.45))
   target_id = str(route["recommended_model_id"])
@@ -478,12 +666,25 @@ def handle_pre_invocation(
   )
 
   did_switch = False
-  verbosity = str(cfg.get("verbosity") or "normal")
+  auto_switch_fallback: str | None = None
+
+  if should_switch and not _verify_cascade_ownership(conv_id):
+    should_switch = False
+    did_switch = False
+    auto_switch_fallback = "cascade_unowned"
+
   render_info = _build_render_info(
       route,
       current_model=model_name,
       switched=should_switch,
       verbosity=verbosity,
+  )
+  user_md = _build_user_markdown(
+      route,
+      current_model=model_name,
+      switched=should_switch,
+      verbosity=verbosity,
+      render_info=render_info,
   )
 
   if should_switch:
@@ -492,6 +693,8 @@ def handle_pre_invocation(
         {
             "prompt_hash": prompt_hash,
             "render_info": render_info,
+            "user_markdown": user_md,
+            "verbosity": verbosity,
             "rendered": False,
         },
     )
@@ -501,10 +704,25 @@ def handle_pre_invocation(
         int(route["thinking_level"]),
         allowed_enums=set(enums_map.values()),
     )
-    if not did_switch:
+    if did_switch:
+      seen_file.unlink(missing_ok=True)
+    else:
+      reroute_file.unlink(missing_ok=True)
+      auto_switch_fallback = "spawn_failed"
       render_info = _build_render_info(
           route, current_model=model_name, switched=False, verbosity=verbosity
       )
+      user_md = _build_user_markdown(
+          route,
+          current_model=model_name,
+          switched=False,
+          verbosity=verbosity,
+          render_info=render_info,
+      )
+
+  if not did_switch:
+    reroute_file.unlink(missing_ok=True)
+    _save_json_state(seen_file, {"prompt_hash": prompt_hash})
 
   _save_json_state(
       thread_file,
@@ -525,36 +743,30 @@ def handle_pre_invocation(
           ),
       },
   )
-  _append_telemetry(
-      sdir,
-      {
-          "ts": datetime.now(timezone.utc).isoformat(),
-          "event": "PreInvocation",
-          "prompt": _prompt_preview(cleaned),
-          "mode": mode,
-          "did_auto_switch": did_switch,
-          "current_model": model_name,
-          "recommended_model_id": route["recommended_model_id"],
-          "subagent_tier": route["subagent_tier"],
-          "thinking_label": route["thinking_label"],
-          "task_class": route["task_class"],
-          "confidence": route["confidence"],
-          "latency_ms": route["latency_ms"],
-          "backend": route["backend"],
-      },
-  )
+
+  telemetry_event: dict[str, Any] = {
+      "ts": datetime.now(timezone.utc).isoformat(),
+      "event": "PreInvocation",
+      "prompt": _prompt_preview(cleaned),
+      "mode": mode,
+      "did_auto_switch": did_switch,
+      "current_model": model_name,
+      "recommended_model_id": route["recommended_model_id"],
+      "subagent_tier": route["subagent_tier"],
+      "thinking_label": route["thinking_label"],
+      "task_class": route["task_class"],
+      "confidence": route["confidence"],
+      "latency_ms": route["latency_ms"],
+      "backend": route["backend"],
+  }
+  if auto_switch_fallback:
+    telemetry_event["auto_switch_fallback"] = auto_switch_fallback
+  _append_telemetry(sdir, telemetry_event)
 
   if did_switch:
     return {"terminationBehavior": "terminate"}
 
-  return {
-      "injectSteps": [{
-          "systemMessage": {
-              "systemMessage": "",
-              "renderInfo": render_info,
-          }
-      }]
-  }
+  return _make_inject_steps(render_info, user_md, verbosity=verbosity)
 
 
 def handle_pre_tool_use(
@@ -590,27 +802,41 @@ def handle_pre_tool_use(
   if active_state and active_state.get("explicit_model_requested"):
     return {"decision": "allow"}
 
+  verbosity = str(cfg.get("verbosity") or "normal")
   sub_prompt = str(args.get("Prompt") or "").strip()
   sub_role = str(args.get("Role") or "").strip()
   if not sub_prompt:
     tier = str((active_state or {}).get("subagent_tier") or "flash")
     if tier not in ("flash_lite", "flash", "pro"):
       tier = "flash"
-    return {"decision": "allow", "overwrite": {"Model": tier}}
+    empty_out: dict[str, Any] = {
+        "decision": "allow",
+        "overwrite": {"Model": tier},
+    }
+    if verbosity != "silent":
+      empty_out["reason"] = (
+          f"✦ Routed with Intent -> subagent Model={tier} (100% | 0 ms)"
+      )
+    return empty_out
 
   eval_text = (
       sub_prompt
       if len(sub_prompt.split()) <= 4
       else f"Subagent Role: {sub_role}\nTask: {sub_prompt}"
   )
-  sub_route = route_fn(
+  sub_route = _call_route_fn(
+      route_fn,
       eval_text,
+      cfg=cfg,
       user_turn_count=1,
       enable_fast_rules=bool(cfg.get("enable_fast_rules", True)),
   )
   tier = str(sub_route.get("subagent_tier") or "flash")
   if tier not in ("flash_lite", "flash", "pro"):
     tier = "flash"
+
+  conf_pct = int(round(float(sub_route.get("confidence", 0.0)) * 100))
+  lat_ms = int(sub_route.get("latency_ms", 0))
 
   _append_telemetry(
       sdir,
@@ -626,7 +852,13 @@ def handle_pre_tool_use(
           "backend": sub_route.get("backend"),
       },
   )
-  return {"decision": "allow", "overwrite": {"Model": tier}}
+  out: dict[str, Any] = {"decision": "allow", "overwrite": {"Model": tier}}
+  if verbosity != "silent":
+    out["reason"] = (
+        f"✦ Routed with Intent -> subagent Model={tier}"
+        f" ({conf_pct}% | {lat_ms} ms)"
+    )
+  return out
 
 
 # ---- CLI Entrypoints --------------------------------------------------------
@@ -663,32 +895,54 @@ def _cmd_pre_tool_use() -> int:
 
 
 def _cmd_redispatch(ns: argparse.Namespace) -> int:
-  deadline = time.monotonic() + 5.0
-  time.sleep(0.15)
-  while time.monotonic() < deadline:
-    resp = _ls_rpc(
-        "GetCascadeTrajectory", {"cascadeId": ns.cascade_id}, timeout=0.9
+  try:
+    deadline = time.monotonic() + 5.0
+    time.sleep(0.15)
+    saw_idle = False
+    last_resp: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+      last_resp = _ls_rpc(
+          "GetCascadeTrajectory", {"cascadeId": ns.cascade_id}, timeout=0.9
+      )
+      if last_resp and last_resp.get("status") == "CASCADE_RUN_STATUS_IDLE":
+        saw_idle = True
+        break
+      time.sleep(0.1)
+    if not saw_idle:
+      _log_redispatch_error(
+          f"GetCascadeTrajectory did not reach IDLE for cascade={ns.cascade_id}"
+          f" (last_resp={last_resp!r})"
+      )
+    send_resp = _ls_rpc(
+        "SendUserCascadeMessage",
+        {
+            "cascadeId": ns.cascade_id,
+            "items": [],
+            "cascadeConfig": {
+                "plannerConfig": {
+                    "planModel": ns.model_enum,
+                    "completionConfigOverride": {
+                        "thinkingLevel": int(ns.thinking_level)
+                    },
+                }
+            },
+            "blocking": False,
+        },
+        timeout=4.0,
     )
-    if resp and resp.get("status") == "CASCADE_RUN_STATUS_IDLE":
-      break
-    time.sleep(0.1)
-  _ls_rpc(
-      "SendUserCascadeMessage",
-      {
-          "cascadeId": ns.cascade_id,
-          "items": [],
-          "cascadeConfig": {
-              "plannerConfig": {
-                  "planModel": ns.model_enum,
-                  "completionConfigOverride": {
-                      "thinkingLevel": int(ns.thinking_level)
-                  },
-              }
-          },
-          "blocking": False,
-      },
-      timeout=4.0,
-  )
+    if send_resp is None or (
+        isinstance(send_resp, dict) and "error" in send_resp
+    ):
+      _log_redispatch_error(
+          f"SendUserCascadeMessage failed for cascade={ns.cascade_id}"
+          f" model={ns.model_enum} (resp={send_resp!r})"
+      )
+      return 1
+  except Exception as exc:  # pylint: disable=broad-except
+    _log_redispatch_error(
+        f"Unhandled exception in redispatch for cascade={ns.cascade_id}: {exc!r}"
+    )
+    return 1
   return 0
 
 
@@ -704,6 +958,10 @@ def _cmd_route(ns: argparse.Namespace) -> int:
   )
   verb = ns.verbosity or str(rcfg.get("verbosity") or "normal")
   if ns.pretty or ns.verbosity is not None:
+    if ns.verbosity == "silent":
+      return 0
+    if verb == "silent":
+      verb = "normal"
     banner = _format_intent_banner(
         res,
         current_model=ns.current_model,
@@ -727,13 +985,126 @@ def _cmd_route(ns: argparse.Namespace) -> int:
   return 0
 
 
+def _parse_existing_dotenv(path: pathlib.Path) -> dict[str, str]:
+  entries: dict[str, str] = {}
+  try:
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+      return {}
+    raw = path.read_text(encoding="utf-8", errors="replace")
+  except OSError:
+    return {}
+  for line in raw.splitlines():
+    s = line.strip()
+    if not s or s.startswith("#"):
+      continue
+    if s.startswith("export "):
+      s = s[len("export ") :].strip()
+    if "=" not in s:
+      continue
+    k, v = s.split("=", 1)
+    k = k.strip()
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+      v = v[1:-1]
+    if _ENV_KEY_RE.fullmatch(k) and v:
+      entries[k] = v
+  return entries
+
+
+def _cmd_auth_setup(ns: argparse.Namespace) -> int:
+  """Creates a 0600 private .env file for GUI App and CLI sessions."""
+  dotenv_path = (
+      pathlib.Path(ns.dotenv_path).expanduser()
+      if ns.dotenv_path
+      else _default_dotenv_path()
+  )
+  _ensure_private_dir(dotenv_path.parent)
+
+  try:
+    st = os.lstat(dotenv_path)
+    if stat.S_ISLNK(st.st_mode):
+      sys.stdout.write(
+          json.dumps(
+              {
+                  "ok": False,
+                  "error": "Refusing to write to symlinked .env file.",
+              },
+              indent=2,
+          )
+          + "\n"
+      )
+      return 1
+  except FileNotFoundError:
+    pass
+
+  entries = _parse_existing_dotenv(dotenv_path)
+
+  if ns.from_env:
+    for key in _RECOGNIZED_DOTENV_KEYS:
+      val = os.environ.get(key, "").strip()
+      if val:
+        entries[key] = val
+
+  if ns.api_key_stdin:
+    stdin_key = sys.stdin.read().strip()
+    if stdin_key:
+      entries["GEMINI_API_KEY"] = stdin_key
+
+  if ns.project is not None and ns.project.strip():
+    entries["GOOGLE_CLOUD_PROJECT"] = ns.project.strip()
+
+  if ns.auth_mode is not None and ns.auth_mode.strip():
+    entries["GEMINI_DECISIONS_AUTH_MODE"] = ns.auth_mode.strip()
+
+  cleaned_entries: dict[str, str] = {}
+  for k, v in entries.items():
+    clean_v = str(v).replace("\r", "").replace("\n", "").strip()
+    if _ENV_KEY_RE.fullmatch(k) and clean_v:
+      cleaned_entries[k] = clean_v
+
+  lines = [
+      "# Private credentials for Gemini Decisions Router (permissions: 0600)",
+  ]
+  for k in sorted(cleaned_entries):
+    val = cleaned_entries[k]
+    if any(ch in val for ch in (" ", "\t", "#", '"', "'")):
+      escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+      lines.append(f'{k}="{escaped}"')
+    else:
+      lines.append(f"{k}={val}")
+  payload = ("\n".join(lines) + "\n").encode("utf-8")
+
+  fd = os.open(
+      dotenv_path,
+      os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+      0o600,
+  )
+  try:
+    os.write(fd, payload)
+  finally:
+    os.close(fd)
+  os.chmod(dotenv_path, 0o600)
+
+  report = {
+      "ok": True,
+      "dotenv_path": str(dotenv_path),
+      "permissions": "0600",
+      "keys_written": sorted(cleaned_entries.keys()),
+  }
+  sys.stdout.write(json.dumps(report, indent=2) + "\n")
+  return 0
+
+
 def _cmd_auth_check(ns: argparse.Namespace) -> int:
   """Verifies ADC or API key setup and optionally makes a 1-question probe."""
   try:
     settings = decisions_engine.load_settings()
   except decisions_engine.DecisionError as e:
     sys.stdout.write(
-        json.dumps({"ok": False, "stage": "settings", "error": e.to_dict()}, indent=2)
+        json.dumps(
+            {"ok": False, "stage": "settings", "error": e.to_dict()}, indent=2
+        )
         + "\n"
     )
     return 1
@@ -747,14 +1118,20 @@ def _cmd_auth_check(ns: argparse.Namespace) -> int:
   }
 
   try:
+    eff_env = _effective_environ()
     if settings.auth_mode == "api_key":
-      has_key = bool(os.environ.get("GEMINI_API_KEY", "").strip())
-      if not has_key:
+      has_env_key = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+      has_eff_key = bool(str(eff_env.get("GEMINI_API_KEY", "")).strip())
+      if not has_eff_key:
         raise decisions_engine.ConfigError(
             "GEMINI_API_KEY is empty. Use keyless ADC"
-            " (GEMINI_DECISIONS_AUTH_MODE=gemini_adc) or export GEMINI_API_KEY."
+            " (GEMINI_DECISIONS_AUTH_MODE=gemini_adc), run"
+            " `agy-router auth-setup --api-key-stdin`, or export"
+            " GEMINI_API_KEY."
         )
-      report["credential_source"] = "env:GEMINI_API_KEY"
+      report["credential_source"] = (
+          "env:GEMINI_API_KEY" if has_env_key else "dotenv:GEMINI_API_KEY"
+      )
       report["endpoint"] = decisions_engine.build_decisions_url(settings)
     else:
       scopes = (
@@ -802,6 +1179,8 @@ def _cmd_auth_check(ns: argparse.Namespace) -> int:
 
 def _cmd_status() -> int:
   rcfg = load_router_config()
+  eff_env = _effective_environ()
+  dotenv_path = _default_dotenv_path()
   try:
     settings = decisions_engine.load_settings()
     backend_info = {
@@ -810,7 +1189,10 @@ def _cmd_status() -> int:
         "model": settings.model,
         "project_id": settings.project_id or "(auto from ADC)",
         "location": settings.location,
-        "gemini_api_key_set": bool(os.environ.get("GEMINI_API_KEY")),
+        "gemini_api_key_set": bool(
+            str(eff_env.get("GEMINI_API_KEY", "")).strip()
+        ),
+        "private_dotenv_present": dotenv_path.is_file(),
     }
   except decisions_engine.DecisionError as e:
     backend_info = {"error": e.to_dict()}
@@ -822,6 +1204,7 @@ def _cmd_status() -> int:
   )
   out = {
       "router_config_path": str(default_router_config_path()),
+      "private_dotenv_path": str(dotenv_path),
       "router_config": rcfg,
       "available_target_models": [
           m["id"] for m in catalog["available_target_models"]
@@ -852,9 +1235,7 @@ def _cmd_set_models(ns: argparse.Namespace) -> int:
       else dict(rcfg.get("tier_models") or decisions_engine.DEFAULT_TIER_MODELS)
   )
   custom_enums = (
-      {}
-      if ns.reset
-      else dict(rcfg.get("custom_model_enums") or {})
+      {} if ns.reset else dict(rcfg.get("custom_model_enums") or {})
   )
   if ns.flash_lite:
     tier_models["flash_lite"] = ns.flash_lite.strip()
@@ -920,6 +1301,129 @@ def _cmd_set_verbosity(ns: argparse.Namespace) -> int:
   return 0
 
 
+def _format_watch_line(r: dict[str, Any], *, verbosity: str) -> str:
+  ts = str(r.get("ts") or "")[11:19] or "--:--:--"
+  ev = "SUB" if "PreToolUse" in str(r.get("event") or "") else "TURN"
+  target = str(r.get("recommended_model_id") or r.get("assigned_tier") or "?")
+  tier = str(r.get("subagent_tier") or r.get("assigned_tier") or "?")
+  lat = r.get("latency_ms", 0)
+  conf = r.get("confidence")
+  conf_str = (
+      f"{int(round(float(conf) * 100))}%"
+      if isinstance(conf, (int, float))
+      else "?%"
+  )
+  fallback = r.get("auto_switch_fallback")
+  sw = (
+      "SWITCH"
+      if r.get("did_auto_switch")
+      else ("FALLBACK" if fallback else "ADVISE")
+  )
+  prompt = _prompt_preview(str(r.get("prompt") or ""), max_len=72)
+
+  if verbosity == "compact":
+    return (
+        f"  [{ts}] {ev} {sw} -> {target} [{tier}]"
+        f" ({conf_str} | {lat} ms)  {prompt}"
+    )
+
+  lines = [
+      f"  [{ts}] {ev:<4} {sw:<8} -> {target:<22} [{tier:<10}]"
+      f" ({conf_str} | {lat:>3} ms)"
+  ]
+  if prompt:
+    lines.append(f'           prompt: "{prompt}"')
+  if verbosity == "verbose":
+    detail = (
+        f"           from={r.get('current_model', 'auto')}"
+        f"  task={r.get('task_class', '?')}"
+        f"  backend={r.get('backend', '?')}"
+    )
+    if fallback:
+      detail += f"  fallback={fallback}"
+    lines.append(detail)
+  return "\n".join(lines)
+
+
+def _cmd_watch(ns: argparse.Namespace) -> int:
+  """Streams formatted routing telemetry events in real time."""
+  rcfg = load_router_config()
+  verb = getattr(ns, "verbosity", None) or str(rcfg.get("verbosity") or "normal")
+  if verb == "silent":
+    verb = "compact"
+  sdir = (
+      pathlib.Path(ns.state_dir).expanduser()
+      if getattr(ns, "state_dir", None)
+      else default_state_dir()
+  )
+  log_file = sdir / "telemetry.jsonl"
+
+  header1 = "  ✦ ROUTED WITH INTENT | LIVE MONITOR"
+  header2 = f"    telemetry={log_file}  verbosity={verb}"
+  w = max(len(header1), len(header2), 62) + 2
+  sys.stdout.write(
+      "\n".join([
+          "╭" + "─" * w + "╮",
+          f"│{header1.ljust(w)}│",
+          f"│{header2.ljust(w)}│",
+          "╰" + "─" * w + "╯",
+      ])
+      + "\n"
+  )
+
+  offset = 0
+  if log_file.is_file():
+    try:
+      content = log_file.read_bytes()
+      offset = len(content)
+      rows: list[dict[str, Any]] = []
+      for line in content.decode("utf-8", errors="replace").splitlines():
+        if line.strip():
+          try:
+            rows.append(json.loads(line))
+          except ValueError:
+            continue
+      for r in rows[-20:]:
+        sys.stdout.write(_format_watch_line(r, verbosity=verb) + "\n")
+    except OSError:
+      pass
+  elif ns.once:
+    sys.stdout.write("  (no telemetry events recorded yet)\n")
+
+  sys.stdout.flush()
+  if ns.once:
+    return 0
+
+  interval = max(0.1, float(ns.interval))
+  try:
+    while True:
+      time.sleep(interval)
+      if not log_file.is_file():
+        continue
+      try:
+        size = log_file.stat().st_size
+        if size < offset:
+          offset = 0
+        if size > offset:
+          with open(log_file, "rb") as f:
+            f.seek(offset)
+            chunk = f.read()
+            offset = f.tell()
+          for line in chunk.decode("utf-8", errors="replace").splitlines():
+            if not line.strip():
+              continue
+            try:
+              row = json.loads(line)
+            except ValueError:
+              continue
+            sys.stdout.write(_format_watch_line(row, verbosity=verb) + "\n")
+          sys.stdout.flush()
+      except OSError:
+        continue
+  except KeyboardInterrupt:
+    return 0
+
+
 def _format_stats_pretty(
     recent: list[dict[str, Any]],
     *,
@@ -964,7 +1468,7 @@ def _format_stats_pretty(
         f"  [{ts}] {ev:<4} {sw:<6} -> {target:<22} [{tier:<10}] {lat:>3} ms"
     )
     if prompt:
-      lines.append(f"           prompt: \"{prompt}\"")
+      lines.append(f'           prompt: "{prompt}"')
     if verbosity == "verbose":
       lines.append(
           f"           from={r.get('current_model', 'auto')}"
@@ -1002,7 +1506,13 @@ def _cmd_stats(ns: argparse.Namespace) -> int:
   avg_ms = int(round(sum(latencies) / len(latencies))) if latencies else 0
   if not getattr(ns, "as_json", False):
     rcfg = load_router_config()
-    verb = getattr(ns, "verbosity", None) or str(rcfg.get("verbosity") or "normal")
+    verb = getattr(ns, "verbosity", None) or str(
+        rcfg.get("verbosity") or "normal"
+    )
+    if getattr(ns, "verbosity", None) == "silent":
+      return 0
+    if verb == "silent":
+      verb = "normal"
     sys.stdout.write(
         _format_stats_pretty(
             recent, by_tier=by_tier, avg_ms=avg_ms, verbosity=verb
@@ -1048,6 +1558,34 @@ def main() -> int:
       "--verbosity", choices=list(VALID_VERBOSITY_LEVELS), default=None
   )
 
+  p_setup = sub.add_parser("auth-setup")
+  p_setup.add_argument(
+      "--from-env",
+      action="store_true",
+      help="Copy active GEMINI_API_KEY / GOOGLE_CLOUD_* variables from shell.",
+  )
+  p_setup.add_argument(
+      "--api-key-stdin",
+      action="store_true",
+      help="Read GEMINI_API_KEY securely from standard input.",
+  )
+  p_setup.add_argument(
+      "--project",
+      default=None,
+      help="Set GOOGLE_CLOUD_PROJECT in private .env.",
+  )
+  p_setup.add_argument(
+      "--auth-mode",
+      choices=["auto", "gemini_adc", "vertex_adc", "api_key"],
+      default=None,
+      help="Set GEMINI_DECISIONS_AUTH_MODE in private .env.",
+  )
+  p_setup.add_argument(
+      "--dotenv-path",
+      default=None,
+      help="Override target .env path (default: ~/.config/gemini-decisions-router/.env).",
+  )
+
   p_auth = sub.add_parser("auth-check")
   p_auth.add_argument(
       "--live",
@@ -1084,6 +1622,14 @@ def main() -> int:
   p_verb = sub.add_parser("set-verbosity")
   p_verb.add_argument("verbosity", choices=list(VALID_VERBOSITY_LEVELS))
 
+  p_watch = sub.add_parser("watch")
+  p_watch.add_argument(
+      "--verbosity", choices=list(VALID_VERBOSITY_LEVELS), default=None
+  )
+  p_watch.add_argument("--interval", type=float, default=1.0)
+  p_watch.add_argument("--once", action="store_true")
+  p_watch.add_argument("--state-dir", default=None)
+
   p_stats = sub.add_parser("stats")
   p_stats.add_argument("--limit", type=int, default=50)
   p_stats.add_argument(
@@ -1100,6 +1646,8 @@ def main() -> int:
     return _cmd_redispatch(ns)
   if ns.cmd == "route":
     return _cmd_route(ns)
+  if ns.cmd == "auth-setup":
+    return _cmd_auth_setup(ns)
   if ns.cmd == "auth-check":
     return _cmd_auth_check(ns)
   if ns.cmd == "status":
@@ -1112,6 +1660,8 @@ def main() -> int:
     return _cmd_set_mode(ns)
   if ns.cmd == "set-verbosity":
     return _cmd_set_verbosity(ns)
+  if ns.cmd == "watch":
+    return _cmd_watch(ns)
   if ns.cmd == "stats":
     return _cmd_stats(ns)
   return 0
