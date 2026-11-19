@@ -11,6 +11,8 @@ Hooks supported:
     `"inherit"` and assigns the calibrated `flash_lite`, `flash`, or `pro` tier.
 
 CLI commands:
+  - `launch [AGY_FLAGS...] [PROMPT]` (alias: `run`, or top-level `agyr`)
+  - `chat [--conversation ID] [--agy-bin PATH]`
   - `auth-setup [--from-env] [--api-key-stdin] [--project ID] [--auth-mode MODE]`
   - `auth-check [--live]`
   - `route --prompt "..."`
@@ -27,19 +29,21 @@ CLI commands:
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
 import time
 from typing import Any
 import urllib.request
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import decisions_engine  # noqa: E402
@@ -753,20 +757,29 @@ def _is_agy_cli_environment(hook_input: Mapping[str, Any]) -> bool:
   return False
 
 
-def _build_cli_badge_line(route: Mapping[str, Any]) -> str:
+def _build_cli_badge_line(
+    route: Mapping[str, Any], *, switched: bool = False
+) -> str:
   """Formats the concise 1-line routing badge rendered inside `agy` CLI."""
   conf_pct = int(round(float(route.get("confidence", 0.0)) * 100))
   model_id = str(route.get("recommended_model_id") or "auto")
   thinking = str(route.get("thinking_label") or "Medium")
   latency = int(route.get("latency_ms", 0))
+  if switched:
+    return (
+        f"> ✦ **Routed with Intent** (Auto-Switched) -> `{model_id}`"
+        f" [{thinking}] · {conf_pct}% · {latency} ms"
+    )
   return (
       f"> ✦ **Routed with Intent** -> `{model_id}` [{thinking}]"
       f" · {conf_pct}% · {latency} ms"
   )
 
 
-def _build_cli_system_instruction(route: Mapping[str, Any]) -> str:
-  badge = _build_cli_badge_line(route)
+def _build_cli_system_instruction(
+    route: Mapping[str, Any], *, switched: bool = False
+) -> str:
+  badge = _build_cli_badge_line(route, switched=switched)
   return (
       "Begin your response with this exact 1-line routing badge on its own"
       " line, followed by a blank line, then answer the user's request"
@@ -822,6 +835,43 @@ def _call_route_fn(
       call_kwargs.pop("enable_thread_floor", None)
       return route_fn(prompt, **call_kwargs)
   return route_fn(prompt, **call_kwargs)
+
+
+def _compute_next_thread_state(
+    route: Mapping[str, Any],
+    prev_thread_state: Mapping[str, Any] | None,
+    *,
+    cfg: Mapping[str, Any],
+    turn_num: int,
+) -> dict[str, Any]:
+  """Computes updated asymmetric Turn 2+ thread floor state."""
+  if route.get("thread_lock_applied") and prev_thread_state:
+    persisted_task_class = str(
+        prev_thread_state.get("locked_task_class") or route["task_class"]
+    )
+    persisted_tier = str(route["subagent_tier"])
+    persisted_model = str(route["recommended_model_id"])
+    persisted_think = int(route["thinking_level"])
+  elif str(route["task_class"]) == "quick_lookup":
+    persisted_task_class = "quick_lookup"
+    persisted_tier = "flash_lite"
+    persisted_model = str(
+        (cfg.get("tier_models") or {}).get("flash_lite")
+        or route["recommended_model_id"]
+    )
+    persisted_think = 1
+  else:
+    persisted_task_class = str(route["task_class"])
+    persisted_tier = str(route["subagent_tier"])
+    persisted_model = str(route["recommended_model_id"])
+    persisted_think = int(route["thinking_level"])
+  return {
+      "locked_tier": persisted_tier,
+      "locked_model_id": persisted_model,
+      "locked_thinking_level": persisted_think,
+      "locked_task_class": persisted_task_class,
+      "turn_count_seen": turn_num,
+  }
 
 
 def handle_pre_invocation(
@@ -892,6 +942,161 @@ def handle_pre_invocation(
   thread_state = _load_json_state(thread_file, max_age_s=7 * 86400.0)
   if thread_state and turn_num == 1:
     turn_num = int(thread_state.get("turn_count_seen", 1)) + 1
+
+  # Pre-routed Turn-1 handoff from `agyr` (`launch`) or `agy-router chat`:
+  # skips duplicate route_fn scoring and duplicate telemetry while seeding state.
+  pre_raw = os.environ.get("GEMINI_DECISIONS_PRE_ROUTED", "").strip()
+  if pre_raw:
+    try:
+      pre = json.loads(pre_raw)
+    except ValueError:
+      pre = None
+    if isinstance(pre, dict) and str(pre.get("prompt_hash") or "") == prompt_hash:
+      pre_src = (
+          pre.get("route")
+          if isinstance(pre.get("route"), Mapping)
+          else pre
+      )
+      pre_task_class = str(
+          pre.get("task_class")
+          or pre_src.get("task_class")
+          or "coding_edit"
+      )
+      pre_tier = str(
+          pre.get("subagent_tier")
+          or pre.get("tier")
+          or pre_src.get("subagent_tier")
+          or pre_src.get("recommended_tier")
+          or "flash"
+      )
+      if pre_tier not in ("flash_lite", "flash", "pro"):
+        pre_tier = "flash"
+      pre_model_id = str(
+          pre.get("recommended_model_id")
+          or pre.get("model_id")
+          or pre_src.get("recommended_model_id")
+          or (cfg.get("tier_models") or {}).get(pre_tier)
+          or model_name
+      )
+      try:
+        pre_think = max(
+            1,
+            min(
+                4,
+                int(
+                    pre.get("thinking_level")
+                    or pre_src.get("thinking_level")
+                    or 2
+                ),
+            ),
+        )
+      except (TypeError, ValueError):
+        pre_think = 2
+      pre_think_label = str(
+          pre.get("thinking_label")
+          or pre_src.get("thinking_label")
+          or decisions_engine.THINKING_LABELS.get(pre_think, "Medium")
+      )
+      try:
+        pre_conf = float(
+            pre.get("confidence")
+            if pre.get("confidence") is not None
+            else pre_src.get("confidence", 0.95)
+        )
+      except (TypeError, ValueError):
+        pre_conf = 0.95
+      try:
+        pre_lat = int(
+            pre.get("latency_ms")
+            if pre.get("latency_ms") is not None
+            else pre_src.get("latency_ms", 0)
+        )
+      except (TypeError, ValueError):
+        pre_lat = 0
+      pre_backend = str(
+          pre.get("backend") or pre_src.get("backend") or "pre_routed"
+      )
+      pre_rationale = str(
+          pre.get("rationale")
+          or pre_src.get("rationale")
+          or "Pre-routed by CLI launcher."
+      )
+      pre_explicit = bool(
+          pre.get("explicit_model_requested")
+          if "explicit_model_requested" in pre
+          else pre_src.get("explicit_model_requested", False)
+      )
+
+      _save_json_state(seen_file, {"prompt_hash": prompt_hash})
+      _save_json_state(
+          safe_state_path(sdir, conv_id, "active_turn"),
+          {
+              "subagent_tier": pre_tier,
+              "explicit_model_requested": pre_explicit,
+          },
+      )
+      if bool(cfg.get("enable_thread_floor", True)) and (
+          pre_task_class != "quick_lookup"
+      ):
+        _save_json_state(
+            thread_file,
+            {
+                "locked_tier": pre_tier,
+                "locked_model_id": pre_model_id,
+                "locked_thinking_level": pre_think,
+                "locked_task_class": pre_task_class,
+                "turn_count_seen": turn_num,
+            },
+        )
+      handoff_tok = str(pre.get("handoff_token") or "").strip()
+      if handoff_tok and _SAFE_ID_RE.fullmatch(handoff_tok):
+        _save_json_state(
+            safe_state_path(sdir, handoff_tok, "chat_handoff"),
+            {"conversation_id": conv_id},
+        )
+
+      if (
+          verbosity != "silent"
+          and bool(pre.get("inject_cli_badge", True))
+          and bool(cfg.get("cli_inline_banner", True))
+      ):
+        synth_route: dict[str, Any] = {
+            "recommended_model_id": pre_model_id,
+            "subagent_tier": pre_tier,
+            "thinking_level": pre_think,
+            "thinking_label": pre_think_label,
+            "task_class": pre_task_class,
+            "confidence": pre_conf,
+            "latency_ms": pre_lat,
+            "backend": pre_backend,
+            "rationale": pre_rationale,
+            "probabilities": {},
+            "thread_lock_applied": bool(pre.get("thread_lock_applied", False)),
+            "explicit_model_requested": pre_explicit,
+        }
+        pre_ri = _build_render_info(
+            synth_route,
+            current_model=model_name,
+            switched=True,
+            verbosity=verbosity,
+        )
+        pre_md = _build_user_markdown(
+            synth_route,
+            current_model=model_name,
+            switched=True,
+            verbosity=verbosity,
+            render_info=pre_ri,
+        )
+        pre_cli_msg = _build_cli_system_instruction(
+            synth_route, switched=True
+        )
+        return _make_inject_steps(
+            pre_ri,
+            pre_md,
+            verbosity=verbosity,
+            cli_system_message=pre_cli_msg,
+        )
+      return {}
 
   route = _call_route_fn(
       route_fn,
@@ -982,36 +1187,11 @@ def handle_pre_invocation(
 
   # Only lock substantive non-lookup work onto flash/pro; preserve locked_task_class
   # when thread_lock_applied held an earlier floor, and decay on standalone quick_lookup.
-  if route.get("thread_lock_applied") and thread_state:
-    persisted_task_class = str(
-        thread_state.get("locked_task_class") or route["task_class"]
-    )
-    persisted_tier = str(route["subagent_tier"])
-    persisted_model = str(route["recommended_model_id"])
-    persisted_think = int(route["thinking_level"])
-  elif str(route["task_class"]) == "quick_lookup":
-    persisted_task_class = "quick_lookup"
-    persisted_tier = "flash_lite"
-    persisted_model = str(
-        (cfg.get("tier_models") or {}).get("flash_lite")
-        or route["recommended_model_id"]
-    )
-    persisted_think = 1
-  else:
-    persisted_task_class = str(route["task_class"])
-    persisted_tier = str(route["subagent_tier"])
-    persisted_model = str(route["recommended_model_id"])
-    persisted_think = int(route["thinking_level"])
-
   _save_json_state(
       thread_file,
-      {
-          "locked_tier": persisted_tier,
-          "locked_model_id": persisted_model,
-          "locked_thinking_level": persisted_think,
-          "locked_task_class": persisted_task_class,
-          "turn_count_seen": turn_num,
-      },
+      _compute_next_thread_state(
+          route, thread_state, cfg=cfg, turn_num=turn_num
+      ),
   )
   _save_json_state(
       safe_state_path(sdir, conv_id, "active_turn"),
@@ -1924,13 +2104,880 @@ def _cmd_stats(ns: argparse.Namespace) -> int:
   return 0
 
 
-def main() -> int:
+_THINKING_EFFORT_FALLBACK: dict[int, str] = {
+    1: "low",
+    2: "medium",
+    3: "high",
+    4: "max",
+}
+
+_AGY_KNOWN_SUBCOMMANDS = frozenset({
+    "acp",
+    "agent",
+    "agents",
+    "changelog",
+    "help",
+    "install",
+    "mcp",
+    "mic-serve",
+    "models",
+    "plugin",
+    "plugins",
+    "remote-control",
+    "update",
+    "version",
+})
+
+_AGY_VALUE_FLAGS = frozenset({
+    "--add-dir",
+    "--agent",
+    "--conversation",
+    "--effort",
+    "--input-format",
+    "--json-schema",
+    "--log-file",
+    "--mode",
+    "--model",
+    "--output-format",
+    "--print-timeout",
+    "--project",
+    "--settings",
+})
+
+_AGY_PRINT_FLAGS = frozenset({"-p", "--print", "--prompt"})
+_AGY_INTERACTIVE_FLAGS = frozenset({"-i", "--prompt-interactive"})
+
+
+def _resolve_agy_executable(agy_bin_override: str | None = None) -> str:
+  if agy_bin_override and agy_bin_override.strip():
+    return agy_bin_override.strip()
+  env_bin = os.environ.get("AGY_BIN", "").strip()
+  if env_bin:
+    return env_bin
+  found = shutil.which("agy")
+  if found:
+    return found
+  fallback = pathlib.Path.home() / ".local" / "bin" / "agy"
+  if fallback.is_file() and os.access(fallback, os.X_OK):
+    return str(fallback)
+  return "agy"
+
+
+def _resolve_cli_launch_target_compat(
+    route: Mapping[str, Any],
+    *,
+    tier_models: Mapping[str, str] | None = None,
+    discovered_models: Sequence[Mapping[str, Any]] | None = None,
+    discovered_cache_path: str | os.PathLike[str] | None = None,
+    agy_bin: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+  """Resolves CLI `--model` and `--effort` via `decisions_engine` with fallback."""
+  engine_fn = getattr(decisions_engine, "resolve_cli_launch_target", None)
+  if callable(engine_fn):
+    return engine_fn(
+        route,
+        tier_models=tier_models,
+        discovered_models=discovered_models,
+        discovered_cache_path=discovered_cache_path,
+        agy_bin=agy_bin,
+        environ=environ,
+    )
+
+  # Standalone compatibility fallback prior to branch merge
+  if discovered_models is not None:
+    discovered = [m for m in discovered_models if isinstance(m, Mapping)]
+  elif (
+      environ is not None
+      and discovered_cache_path is None
+      and agy_bin is None
+  ):
+    discovered = []
+  else:
+    discover_fn = getattr(decisions_engine, "discover_installed_models", None)
+    discovered = (
+        discover_fn(
+            agy_bin=agy_bin,
+            cache_path=discovered_cache_path,
+            run_cli_fallback=True,
+        )
+        if callable(discover_fn)
+        else []
+    )
+
+  cli_only = [
+      m for m in discovered if str(m.get("source") or "") == "discovered_cli"
+  ]
+  cli_models = cli_only if cli_only else list(discovered)
+  cli_model_ids = {
+      str(m.get("id") or "").strip()
+      for m in cli_models
+      if str(m.get("id") or "").strip()
+  }
+
+  tier = str(
+      route.get("subagent_tier") or route.get("recommended_tier") or "flash"
+  )
+  if tier not in decisions_engine.TIER_RANKS:
+    tier = "flash"
+  try:
+    thinking_level = max(1, min(4, int(route.get("thinking_level") or 2)))
+  except (TypeError, ValueError):
+    thinking_level = 2
+  effort_map = getattr(
+      decisions_engine, "THINKING_EFFORT_FLAGS", _THINKING_EFFORT_FALLBACK
+  )
+  effort = str(effort_map.get(thinking_level, "medium"))
+
+  resolved_tiers = decisions_engine.resolve_tier_models(
+      tier_models, environ=environ
+  )
+  original_id = str(
+      route.get("recommended_model_id") or resolved_tiers[tier]
+  ).strip()
+  chosen_id = original_id
+
+  if cli_models and chosen_id not in cli_model_ids:
+    suggested_map = decisions_engine.suggest_tier_models(cli_models)
+    suggested = str(suggested_map.get(tier) or "").strip()
+    if suggested and suggested in cli_model_ids:
+      chosen_id = suggested
+    else:
+      tier_match = next(
+          (
+              str(m.get("id")).strip()
+              for m in cli_models
+              if str(m.get("tier") or "") == tier
+              and str(m.get("id") or "").strip()
+          ),
+          "",
+      )
+      chosen_id = (
+          tier_match
+          if tier_match
+          else str(cli_models[0].get("id") or original_id).strip()
+      )
+
+  base_id = _THINKING_VARIANT_SUFFIX_RE.sub("", chosen_id)
+  final_id = chosen_id
+  if f"{base_id}-{effort}" in cli_model_ids:
+    final_id = f"{base_id}-{effort}"
+  elif effort == "max":
+    for alt_suffix in ("xhigh", "high"):
+      if f"{base_id}-{alt_suffix}" in cli_model_ids:
+        final_id = f"{base_id}-{alt_suffix}"
+        break
+
+  return {
+      "model_id": final_id,
+      "effort": effort,
+      "tier": tier,
+      "thinking_level": thinking_level,
+      "fallback_from": original_id if final_id != original_id else "",
+  }
+
+
+def _resolve_cli_target_for_session(
+    route: Mapping[str, Any],
+    *,
+    cfg: Mapping[str, Any],
+    agy_bin: str,
+    discovered_models: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+  """Resolves CLI launch target while staying hermetic in isolated test dirs."""
+  if discovered_models is not None:
+    return _resolve_cli_launch_target_compat(
+        route,
+        tier_models=cfg.get("tier_models"),
+        discovered_models=discovered_models,
+        agy_bin=agy_bin,
+    )
+
+  explicit_state = os.environ.get("GEMINI_DECISIONS_STATE_DIR", "").strip()
+  explicit_cfg = os.environ.get("GEMINI_DECISIONS_ROUTER_CONFIG", "").strip()
+  cpath = (
+      (pathlib.Path(explicit_state) / "discovered_models.json")
+      if explicit_state
+      else _default_discovered_models_path()
+  )
+  if (explicit_state or explicit_cfg) and not cpath.is_file() and not (
+      os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip()
+  ):
+    return _resolve_cli_launch_target_compat(
+        route,
+        tier_models=cfg.get("tier_models"),
+        discovered_models=[],
+    )
+  return _resolve_cli_launch_target_compat(
+      route,
+      tier_models=cfg.get("tier_models"),
+      discovered_cache_path=cpath,
+      agy_bin=agy_bin,
+  )
+
+
+def _parse_launch_argv(raw_args: Sequence[str]) -> dict[str, Any]:
+  """Parses `agyr` / `agy-router launch` arguments while preserving `agy` flags."""
+  dry_run = False
+  want_help = False
+  agy_bin_override: str | None = None
+  has_explicit_model = False
+  has_explicit_effort = False
+  has_explicit_agent = False
+  has_continue = False
+  has_conversation = False
+  output_format = "text"
+
+  prompt_flag_mode: str | None = None  # "print" | "interactive" | None
+  prompt_from_flag: str | None = None
+  passthrough_all: list[str] = []
+  passthrough_without_prompt: list[str] = []
+  positionals: list[str] = []
+
+  idx = 0
+  n = len(raw_args)
+  after_ddash = False
+  while idx < n:
+    tok = raw_args[idx]
+    if after_ddash:
+      positionals.append(tok)
+      passthrough_all.append(tok)
+      idx += 1
+      continue
+    if tok == "--":
+      after_ddash = True
+      passthrough_all.append(tok)
+      idx += 1
+      continue
+    if tok in ("-h", "--help"):
+      want_help = True
+      idx += 1
+      continue
+    if tok == "--dry-run":
+      dry_run = True
+      idx += 1
+      continue
+    if tok == "--agy-bin":
+      if idx + 1 < n:
+        agy_bin_override = raw_args[idx + 1]
+        idx += 2
+      else:
+        idx += 1
+      continue
+    if tok.startswith("--agy-bin="):
+      agy_bin_override = tok.split("=", 1)[1]
+      idx += 1
+      continue
+
+    # Print / interactive prompt flags
+    if tok in _AGY_PRINT_FLAGS:
+      prompt_flag_mode = "print"
+      passthrough_all.append(tok)
+      if idx + 1 < n:
+        prompt_from_flag = raw_args[idx + 1]
+        passthrough_all.append(raw_args[idx + 1])
+        idx += 2
+      else:
+        prompt_from_flag = ""
+        idx += 1
+      continue
+    if any(tok.startswith(f"{pf}=") for pf in ("--print", "--prompt")):
+      prompt_flag_mode = "print"
+      prompt_from_flag = tok.split("=", 1)[1]
+      passthrough_all.append(tok)
+      idx += 1
+      continue
+    if tok in _AGY_INTERACTIVE_FLAGS:
+      prompt_flag_mode = "interactive"
+      passthrough_all.append(tok)
+      if idx + 1 < n:
+        prompt_from_flag = raw_args[idx + 1]
+        passthrough_all.append(raw_args[idx + 1])
+        idx += 2
+      else:
+        prompt_from_flag = ""
+        idx += 1
+      continue
+    if tok.startswith("--prompt-interactive="):
+      prompt_flag_mode = "interactive"
+      prompt_from_flag = tok.split("=", 1)[1]
+      passthrough_all.append(tok)
+      idx += 1
+      continue
+
+    # Track explicit flags in passthrough
+    if tok in ("-c", "--continue"):
+      has_continue = True
+      passthrough_all.append(tok)
+      passthrough_without_prompt.append(tok)
+      idx += 1
+      continue
+    if tok == "--model" or tok.startswith("--model="):
+      has_explicit_model = True
+    elif tok == "--effort" or tok.startswith("--effort="):
+      has_explicit_effort = True
+    elif tok == "--agent" or tok.startswith("--agent="):
+      has_explicit_agent = True
+    elif tok == "--conversation" or tok.startswith("--conversation="):
+      has_conversation = True
+
+    if tok.startswith("--output-format="):
+      output_format = tok.split("=", 1)[1].strip().lower()
+    elif tok == "--output-format" and idx + 1 < n:
+      output_format = raw_args[idx + 1].strip().lower()
+
+    if tok in _AGY_VALUE_FLAGS:
+      passthrough_all.append(tok)
+      passthrough_without_prompt.append(tok)
+      if idx + 1 < n:
+        passthrough_all.append(raw_args[idx + 1])
+        passthrough_without_prompt.append(raw_args[idx + 1])
+        idx += 2
+      else:
+        idx += 1
+      continue
+
+    if tok.startswith("-"):
+      passthrough_all.append(tok)
+      passthrough_without_prompt.append(tok)
+      idx += 1
+      continue
+
+    positionals.append(tok)
+    passthrough_all.append(tok)
+    idx += 1
+
+  return {
+      "dry_run": dry_run,
+      "want_help": want_help,
+      "agy_bin_override": agy_bin_override,
+      "has_explicit_model": has_explicit_model,
+      "has_explicit_effort": has_explicit_effort,
+      "has_explicit_agent": has_explicit_agent,
+      "has_continue": has_continue,
+      "has_conversation": has_conversation,
+      "output_format": output_format,
+      "prompt_flag_mode": prompt_flag_mode,
+      "prompt_from_flag": prompt_from_flag,
+      "passthrough_all": passthrough_all,
+      "passthrough_without_prompt": passthrough_without_prompt,
+      "positionals": positionals,
+  }
+
+
+def _build_pre_routed_payload(
+    prompt_text: str,
+    display_route: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    inject_cli_badge: bool = False,
+    handoff_token: str = "",
+) -> dict[str, Any]:
+  cleaned = _clean_user_prompt(prompt_text)
+  prompt_hash = hashlib.sha256(
+      cleaned.encode("utf-8", "ignore")
+  ).hexdigest()[:16]
+  payload: dict[str, Any] = {
+      "prompt_hash": prompt_hash,
+      "task_class": display_route["task_class"],
+      "subagent_tier": target["tier"],
+      "recommended_model_id": target["model_id"],
+      "thinking_level": target["thinking_level"],
+      "thinking_label": display_route["thinking_label"],
+      "confidence": display_route["confidence"],
+      "latency_ms": display_route["latency_ms"],
+      "backend": display_route["backend"],
+      "rationale": display_route["rationale"],
+      "thread_lock_applied": bool(display_route.get("thread_lock_applied")),
+      "explicit_model_requested": bool(
+          display_route.get("explicit_model_requested")
+      ),
+      "inject_cli_badge": inject_cli_badge,
+  }
+  if handoff_token:
+    payload["handoff_token"] = handoff_token
+  return payload
+
+
+def build_launch_plan(
+    raw_args: Sequence[str],
+    *,
+    config_path: pathlib.Path | None = None,
+    route_fn: Callable[..., dict[str, Any]] = decisions_engine.route_prompt,
+    discovered_models: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+  """Computes the `agyr` / `agy-router launch` execution plan."""
+  parsed = _parse_launch_argv(raw_args)
+  agy_bin = _resolve_agy_executable(parsed["agy_bin_override"])
+  cfg = load_router_config(config_path)
+
+  # 1. Explicit `--model` passed by user -> passthrough untouched
+  if parsed["has_explicit_model"]:
+    return {
+        "action": "passthrough_explicit_model",
+        "agy_cmd": [agy_bin, *parsed["passthrough_all"]],
+        "route": None,
+        "target": None,
+        "dry_run": parsed["dry_run"],
+    }
+
+  is_subcommand = (
+      parsed["prompt_flag_mode"] is None
+      and bool(parsed["positionals"])
+      and parsed["positionals"][0] in _AGY_KNOWN_SUBCOMMANDS
+  )
+  if is_subcommand:
+    return {
+        "action": "passthrough_subcommand",
+        "agy_cmd": [agy_bin, *parsed["passthrough_all"]],
+        "route": None,
+        "target": None,
+        "dry_run": parsed["dry_run"],
+    }
+
+  if parsed["prompt_flag_mode"] is not None:
+    prompt: str | None = str(parsed["prompt_from_flag"] or "")
+    is_print = parsed["prompt_flag_mode"] == "print"
+  elif parsed["positionals"]:
+    prompt = " ".join(parsed["positionals"])
+    is_print = False
+  else:
+    prompt = None
+    is_print = False
+
+  # 2. `-c` / `--continue` or `--conversation` without a prompt -> passthrough
+  if (parsed["has_continue"] or parsed["has_conversation"]) and not (
+      prompt and prompt.strip()
+  ):
+    return {
+        "action": "passthrough_resume",
+        "agy_cmd": [agy_bin, *parsed["passthrough_all"]],
+        "route": None,
+        "target": None,
+        "dry_run": parsed["dry_run"],
+    }
+
+  # 3. Case 1: Prompt provided -> score prompt & resolve CLI `--model` + `--effort`
+  if prompt is not None and prompt.strip():
+    cleaned_prompt = _clean_user_prompt(prompt) or prompt.strip()
+    route = _call_route_fn(
+        route_fn,
+        cleaned_prompt,
+        cfg=cfg,
+        current_model="cli_auto",
+        user_turn_count=1,
+        enable_fast_rules=bool(cfg.get("enable_fast_rules", True)),
+    )
+    target = _resolve_cli_target_for_session(
+        route,
+        cfg=cfg,
+        agy_bin=agy_bin,
+        discovered_models=discovered_models,
+    )
+    think_label = decisions_engine.THINKING_LABELS.get(
+        int(target["thinking_level"]),
+        str(route.get("thinking_label") or "Medium"),
+    )
+    display_route: dict[str, Any] = {
+        **route,
+        "recommended_model_id": target["model_id"],
+        "subagent_tier": target["tier"],
+        "thinking_level": target["thinking_level"],
+        "thinking_label": think_label,
+    }
+    cmd = [agy_bin, "--model", str(target["model_id"])]
+    if not parsed["has_explicit_effort"]:
+      cmd.extend(["--effort", str(target["effort"])])
+    cmd.extend(parsed["passthrough_without_prompt"])
+    cmd.extend(["-p" if is_print else "-i", prompt])
+
+    pre_routed = _build_pre_routed_payload(
+        cleaned_prompt,
+        display_route,
+        target,
+        inject_cli_badge=False,
+    )
+    return {
+        "action": "route_print" if is_print else "route_interactive",
+        "agy_cmd": cmd,
+        "route": display_route,
+        "target": target,
+        "pre_routed": pre_routed,
+        "is_print": is_print,
+        "output_format": parsed["output_format"],
+        "cleaned_prompt": cleaned_prompt,
+        "dry_run": parsed["dry_run"],
+    }
+
+  # 4. Case 2: Bare `agyr` (no prompt, no -p, no -c) -> TUI with `intent-router`
+  seed_route = {
+      "task_class": "quick_lookup",
+      "recommended_tier": "flash_lite",
+      "subagent_tier": "flash_lite",
+      "recommended_model_id": str(
+          (cfg.get("tier_models") or {}).get("flash_lite")
+          or decisions_engine.DEFAULT_TIER_MODELS["flash_lite"]
+      ),
+      "thinking_level": 1,
+      "thinking_label": "Low",
+      "confidence": 1.0,
+      "latency_ms": 0,
+      "backend": "tui_intent_router",
+  }
+  target = _resolve_cli_target_for_session(
+      seed_route,
+      cfg=cfg,
+      agy_bin=agy_bin,
+      discovered_models=discovered_models,
+  )
+  cmd = [agy_bin]
+  if not parsed["has_explicit_agent"]:
+    cmd.extend(["--agent", "intent-router"])
+  cmd.extend(["--model", str(target["model_id"])])
+  if not parsed["has_explicit_effort"]:
+    cmd.extend(["--effort", "low"])
+  cmd.extend(parsed["passthrough_without_prompt"])
+  return {
+      "action": "launch_tui_intent_router",
+      "agy_cmd": cmd,
+      "route": None,
+      "target": target,
+      "dry_run": parsed["dry_run"],
+  }
+
+
+def _cmd_launch(raw_args: Sequence[str]) -> int:
+  parsed = _parse_launch_argv(raw_args)
+  if parsed["want_help"]:
+    sys.stdout.write(
+        "Usage: agyr [AGY_FLAGS...] [PROMPT]\n"
+        "       agy-router launch [--dry-run] [--agy-bin PATH] [AGY_FLAGS...] [PROMPT]\n"
+        "       agy-router run [--dry-run] [--agy-bin PATH] [AGY_FLAGS...] [PROMPT]\n\n"
+        "Scores prompts via Gemini Decisions API (`gemini-decision-1`) before\n"
+        "launching `agy` with the calibrated `--model` and `--effort` flags,\n"
+        "or starts the interactive `intent-router` TUI agent when invoked bare.\n"
+    )
+    return 0
+
+  cfg = load_router_config()
+  verbosity = str(cfg.get("verbosity") or "normal")
+  sdir = default_state_dir()
+  plan = build_launch_plan(raw_args)
+
+  if plan["dry_run"]:
+    dry_out = {
+        "action": plan["action"],
+        "agy_cmd": plan["agy_cmd"],
+        "route": plan["route"],
+        "target": plan["target"],
+    }
+    if "pre_routed" in plan:
+      dry_out["pre_routed"] = plan["pre_routed"]
+    sys.stdout.write(json.dumps(dry_out, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+  action = str(plan["action"])
+  agy_cmd = list(plan["agy_cmd"])
+  agy_bin = agy_cmd[0]
+
+  if action in ("route_print", "route_interactive"):
+    route = plan["route"]
+    target = plan["target"]
+    cleaned_prompt = str(plan["cleaned_prompt"])
+    telemetry_event: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": "PreInvocation",
+        "prompt": _prompt_preview(cleaned_prompt),
+        "mode": "cli_launcher",
+        "did_auto_switch": True,
+        "thread_lock_applied": bool(route.get("thread_lock_applied")),
+        "cli_banner_injected": False,
+        "current_model": "cli_auto",
+        "recommended_model_id": target["model_id"],
+        "subagent_tier": target["tier"],
+        "thinking_label": route["thinking_label"],
+        "task_class": route["task_class"],
+        "confidence": route["confidence"],
+        "latency_ms": route["latency_ms"],
+        "backend": route["backend"],
+    }
+    if target.get("fallback_from"):
+      telemetry_event["cli_model_fallback_from"] = target["fallback_from"]
+    _append_telemetry(sdir, telemetry_event)
+
+    suppress_stderr_banner = bool(plan.get("is_print")) and str(
+        plan.get("output_format") or "text"
+    ) in ("json", "stream-json")
+    if verbosity != "silent" and not suppress_stderr_banner:
+      banner = _format_intent_banner(
+          route,
+          current_model="cli_auto",
+          switched=True,
+          verbosity=verbosity,
+      )
+      if banner:
+        sys.stderr.write(banner + "\n")
+        sys.stderr.flush()
+
+    os.environ["GEMINI_DECISIONS_PRE_ROUTED"] = json.dumps(
+        plan["pre_routed"], ensure_ascii=False
+    )
+  elif action == "launch_tui_intent_router":
+    target = plan["target"]
+    if verbosity != "silent":
+      sys.stderr.write(
+          "✦ Routed with Intent >> agy --agent intent-router"
+          f" --model {target['model_id']} [Low]"
+          " (subagents auto-routed via PreToolUse)\n"
+      )
+      sys.stderr.flush()
+
+  os.execvp(agy_bin, agy_cmd)
+
+
+def _cmd_chat(raw_args: Sequence[str]) -> int:
+  """Interactive multi-turn REPL switching `--model` & `--effort` per turn."""
+  chat_parser = argparse.ArgumentParser(
+      prog="agy-router chat",
+      description="Multi-turn routed REPL wrapping `agy` with per-turn model switching.",
+  )
+  chat_parser.add_argument(
+      "--conversation",
+      default=None,
+      help="Resume an existing `agy` conversation ID.",
+  )
+  chat_parser.add_argument(
+      "--agy-bin",
+      default=None,
+      help="Path to the `agy` executable.",
+  )
+  chat_parser.add_argument(
+      "--verbosity",
+      choices=list(VALID_VERBOSITY_LEVELS),
+      default=None,
+      help="Override routing banner verbosity for this session.",
+  )
+  ns, passthrough_flags = chat_parser.parse_known_args(list(raw_args))
+
+  cfg = load_router_config()
+  verbosity = ns.verbosity or str(cfg.get("verbosity") or "normal")
+  sdir = default_state_dir()
+  agy_bin = _resolve_agy_executable(ns.agy_bin)
+
+  explicit_conv = str(ns.conversation or "").strip()
+  conv_id = explicit_conv or str(uuid.uuid4())
+  resolved_agy_conv_id = explicit_conv
+  session_token = uuid.uuid4().hex[:24]
+  thread_state: dict[str, Any] | None = (
+      _load_json_state(
+          safe_state_path(sdir, explicit_conv, "thread"),
+          max_age_s=7 * 86400.0,
+      )
+      if explicit_conv
+      else None
+  )
+  turn_num = (
+      int(thread_state.get("turn_count_seen", 0))
+      if isinstance(thread_state, dict)
+      else 0
+  )
+  prev_model = "cli_auto"
+  is_tty = sys.stdin.isatty()
+
+  if is_tty and verbosity != "silent":
+    sys.stderr.write(
+        "✦ Routed with Intent | Multi-Turn CLI Chat"
+        " (/new to reset thread, /exit to quit)\n"
+    )
+    sys.stderr.flush()
+
+  while True:
+    if is_tty and verbosity != "silent":
+      sys.stderr.write(f"\nagyr[{turn_num + 1}]> ")
+      sys.stderr.flush()
+    try:
+      raw_line = sys.stdin.readline()
+    except KeyboardInterrupt:
+      if is_tty:
+        sys.stderr.write("\n")
+      break
+    if raw_line == "":
+      break
+    line = raw_line.strip()
+    if not line:
+      continue
+    low_cmd = line.lower()
+    if low_cmd in ("/exit", "/quit"):
+      break
+    if low_cmd in ("/new", "/reset"):
+      conv_id = str(uuid.uuid4())
+      resolved_agy_conv_id = ""
+      session_token = uuid.uuid4().hex[:24]
+      thread_state = None
+      turn_num = 0
+      prev_model = "cli_auto"
+      if verbosity != "silent":
+        sys.stderr.write("✦ Started fresh conversation (thread floor reset).\n")
+        sys.stderr.flush()
+      continue
+
+    turn_num += 1
+    cleaned_line = _clean_user_prompt(line) or line
+    route = _call_route_fn(
+        decisions_engine.route_prompt,
+        cleaned_line,
+        cfg=cfg,
+        current_model=prev_model,
+        user_turn_count=turn_num,
+        thread_state=thread_state,
+        enable_fast_rules=bool(cfg.get("enable_fast_rules", True)),
+    )
+    target = _resolve_cli_target_for_session(
+        route,
+        cfg=cfg,
+        agy_bin=agy_bin,
+    )
+    think_label = decisions_engine.THINKING_LABELS.get(
+        int(target["thinking_level"]),
+        str(route.get("thinking_label") or "Medium"),
+    )
+    display_route: dict[str, Any] = {
+        **route,
+        "recommended_model_id": target["model_id"],
+        "subagent_tier": target["tier"],
+        "thinking_level": target["thinking_level"],
+        "thinking_label": think_label,
+    }
+
+    telemetry_event: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": "PreInvocation",
+        "conversation_id": resolved_agy_conv_id or conv_id,
+        "prompt": _prompt_preview(cleaned_line),
+        "mode": "cli_chat",
+        "did_auto_switch": True,
+        "thread_lock_applied": bool(display_route.get("thread_lock_applied")),
+        "cli_banner_injected": False,
+        "current_model": prev_model,
+        "recommended_model_id": target["model_id"],
+        "subagent_tier": target["tier"],
+        "thinking_label": think_label,
+        "task_class": display_route["task_class"],
+        "confidence": display_route["confidence"],
+        "latency_ms": display_route["latency_ms"],
+        "backend": display_route["backend"],
+    }
+    if target.get("fallback_from"):
+      telemetry_event["cli_model_fallback_from"] = target["fallback_from"]
+    _append_telemetry(sdir, telemetry_event)
+
+    if verbosity != "silent":
+      banner = _format_intent_banner(
+          display_route,
+          current_model=prev_model,
+          switched=True,
+          verbosity=verbosity,
+      )
+      if banner:
+        sys.stderr.write(banner + "\n")
+        sys.stderr.flush()
+
+    if bool(cfg.get("enable_thread_floor", True)):
+      thread_state = _compute_next_thread_state(
+          display_route, thread_state, cfg=cfg, turn_num=turn_num
+      )
+    else:
+      thread_state = None
+
+    handoff_file = safe_state_path(sdir, session_token, "chat_handoff")
+    handoff_file.unlink(missing_ok=True)
+    pre_routed = _build_pre_routed_payload(
+        cleaned_line,
+        display_route,
+        target,
+        inject_cli_badge=False,
+        handoff_token=session_token,
+    )
+    child_env = dict(os.environ)
+    child_env["GEMINI_DECISIONS_PRE_ROUTED"] = json.dumps(
+        pre_routed, ensure_ascii=False
+    )
+
+    # Note on `agy` CLI conversation creation vs resumption:
+    # Passing `--conversation <unknown-uuid>` on Turn 1 prints a warning in `agy`
+    # ("Conversation <id> not found, ignoring --conversation flag") and creates
+    # a server-generated UUID. Therefore:
+    # - When an existing conversation ID is known (`--conversation ID` or
+    #   captured from Turn 1's PreInvocation hook via `chat_handoff`), pass
+    #   `["--conversation", resolved_agy_conv_id]`.
+    # - On Turn 1 of a fresh chat without `--conversation`, omit `--conversation`
+    #   so `agy` creates the conversation cleanly.
+    # - On Turn 2+ if no `chat_handoff` ID was written (e.g. hooks disabled or
+    #   standalone mock `agy` binary), pass `["--continue"]`.
+    cmd: list[str] = [agy_bin]
+    if resolved_agy_conv_id:
+      cmd.extend(["--conversation", resolved_agy_conv_id])
+    elif turn_num > 1:
+      cmd.append("--continue")
+    cmd.extend([
+        "--model",
+        str(target["model_id"]),
+        "--effort",
+        str(target["effort"]),
+        *passthrough_flags,
+        "-p",
+        line,
+    ])
+    subprocess.run(
+        cmd,
+        env=child_env,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    prev_model = str(target["model_id"])
+
+    if not resolved_agy_conv_id:
+      handoff_data = _load_json_state(handoff_file, max_age_s=600.0)
+      captured = str((handoff_data or {}).get("conversation_id") or "").strip()
+      if captured and captured != "default":
+        resolved_agy_conv_id = captured
+        conv_id = captured
+    handoff_file.unlink(missing_ok=True)
+
+    if thread_state is not None:
+      _save_json_state(
+          safe_state_path(sdir, resolved_agy_conv_id or conv_id, "thread"),
+          thread_state,
+      )
+
+  return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+  raw_argv = list(sys.argv[1:] if argv is None else argv)
+  if raw_argv and raw_argv[0] in ("launch", "run"):
+    return _cmd_launch(raw_argv[1:])
+  if raw_argv and raw_argv[0] == "chat":
+    return _cmd_chat(raw_argv[1:])
+
   parser = argparse.ArgumentParser(
       description="Gemini Decisions Router hooks and CLI for Antigravity"
   )
   sub = parser.add_subparsers(dest="cmd")
   sub.add_parser("pre-invocation")
   sub.add_parser("pre-tool-use")
+  sub.add_parser(
+      "launch",
+      help="Score prompt via Gemini Decisions API and exec `agy` with calibrated --model and --effort.",
+  )
+  sub.add_parser(
+      "run",
+      help="Alias for `launch`.",
+  )
+  sub.add_parser(
+      "chat",
+      help="Interactive multi-turn REPL switching `--model` and `--effort` across turns.",
+  )
 
   p_redisp = sub.add_parser("redispatch")
   p_redisp.add_argument("--cascade-id", required=True)
@@ -2053,7 +3100,7 @@ def main() -> int:
   )
   p_stats.add_argument("--json", dest="as_json", action="store_true")
 
-  ns = parser.parse_args()
+  ns = parser.parse_args(raw_argv)
   if ns.cmd in (None, "pre-invocation"):
     return _cmd_pre_invocation()
   if ns.cmd == "pre-tool-use":

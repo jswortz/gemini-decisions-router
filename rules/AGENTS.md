@@ -15,13 +15,14 @@ This document defines the architecture, non-negotiable security invariants, runt
 
 | Path | Responsibility |
 | :--- | :--- |
-| `decisions_engine.py` | Core runtime engine (pure Python 3.11+ stdlib). Implements `gemini_adc` / `vertex_adc` / `api_key` credential resolution, hardened `0600` `.env` loading (`load_private_dotenv`, `effective_environ`), the `CreateDecision` HTTP client (`create_decision`), input/file security validation, dynamic Antigravity Language Server (`GetAvailableModels`) and `agy models` auto-discovery (`discover_installed_models`, `suggest_tier_models`, `list_available_target_models`), and the 2-tier calibrated router (`route_prompt`). |
-| `router_hook.py` | Antigravity lifecycle hook dispatcher (`pre-invocation`, `pre-tool-use`), background Language Server turn redispatcher (`redispatch`), conversation state & JSONL telemetry manager, and the `agy-router` CLI (`auth-setup`, `auth-check`, `status`, `route`, `watch`, `stats`, `set-mode`, `set-verbosity`, `list-models`, `sync-models`, `set-models`). |
+| `decisions_engine.py` | Core runtime engine (pure Python 3.11+ stdlib). Implements `gemini_adc` / `vertex_adc` / `api_key` credential resolution, hardened `0600` `.env` loading (`load_private_dotenv`, `effective_environ`), the `CreateDecision` HTTP client (`create_decision`), input/file security validation, dynamic Antigravity Language Server (`GetAvailableModels`) and `agy models` auto-discovery (`discover_installed_models`, `suggest_tier_models`, `list_available_target_models`, `resolve_cli_launch_target`), and the 2-tier calibrated router (`route_prompt`). |
+| `router_hook.py` | Antigravity lifecycle hook dispatcher (`pre-invocation`, `pre-tool-use`), `GEMINI_DECISIONS_PRE_ROUTED` zero-cost Turn-1 handoff, background Language Server turn redispatcher (`redispatch`), conversation state & JSONL telemetry manager, top-level routed CLI launcher (`launch` / `run` / `agyr`) and multi-turn REPL (`chat`), and the `agy-router` management CLI (`auth-setup`, `auth-check`, `status`, `route`, `watch`, `stats`, `set-mode`, `set-verbosity`, `list-models`, `sync-models`, `set-models`). |
+| `agents/intent-router.md` | Custom Markdown main agent (`name: intent-router`, `mainAgent: true`, `subagent: false`) for `agy --agent intent-router` and bare `agyr`: answers lightweight `quick_lookup` turns directly in-turn on `flash_lite` and delegates substantive engineering tasks via `invoke_subagent(TypeName="self", Model="inherit")` for dynamic `PreToolUse` tier assignment. |
 | `mcp_server.py` | Newline-delimited JSON-RPC 2.0 stdio MCP server (`McpServer`) exposing `create_decision`, `route_prompt`, `list_models`, and `configure_router` under the `decisions` server (`gemini-decisions-router_decisions` namespace). |
 | `plugin.json` | Antigravity plugin manifest (`name: "gemini-decisions-router"`, `category: "agents"`, version, license, keywords, and `suggestedPrompts`). |
 | `hooks.json` | Lifecycle hook registration wiring `PreInvocation` (`8s` timeout) and `PreToolUse` on matcher `invoke_subagent` (`6s` timeout) to `router_hook.py`. |
 | `mcp_config.json` | MCP stdio server manifest invoking `python3 -E -s -B -u ${PLUGIN_ROOT}/mcp_server.py` (isolated environment, no user site-packages, no `.pyc` generation, unbuffered binary stdio). |
-| `install.sh` | Verifies Python 3.11+, installs plugin files into `${ANTIGRAVITY_PLUGINS_DIR:-~/.gemini/config/plugins}/gemini-decisions-router`, writes the executable `${BIN_DIR:-~/.local/bin}/agy-router` wrapper, and runs `agy plugin validate ... --strict` when `agy` is on `PATH`. |
+| `install.sh` | Verifies Python 3.11+, installs plugin files (including `agents/intent-router.md` and `rules/AGENTS.md`) into `${ANTIGRAVITY_PLUGINS_DIR:-~/.gemini/config/plugins}/gemini-decisions-router`, writes executable `${BIN_DIR:-~/.local/bin}/agy-router` and `${BIN_DIR:-~/.local/bin}/agyr` wrappers, and runs `agy plugin validate ... --strict` when `agy` is on `PATH`. |
 | `skills/gemini-decisions-router/SKILL.md` | Agent skill instructions loaded by Antigravity covering MCP tool schemas, hook behavior, `agy-router` CLI subcommands, and safety rules. |
 | `benchmarks/` | Evaluation harness: `prompts_100.json` (`N=100` stratified prompts across 6 categories + `N=15` E2E subset), `run_benchmark.py` (live API + deterministic offline `--mock` CI runner with live `stdout` routing stats), `run_router_head_to_head.py` (`N=100` `flash-lite` & `flash` JSON routers vs `gemini-decision-1` runner), `render_charts.py` (`1600x1040` Pillow dashboard generator outputting `assets/benchmark-dashboard.png`), `results_100.json`, and `results_flash_lite_router_100.json`. |
 | `docs/` | Operator and architecture guides: `AUTHENTICATION_ADC.md`, `API_KEY_QUICKSTART.md`, `CUSTOMER_ONBOARDING.md`, `BENCHMARKS.md`, and `TESTING_STRATEGY.md`. |
@@ -66,7 +67,7 @@ Every change to this repository must preserve the following invariants:
 - **2-Tier Calibrated Routing:**
   - **Tier 0 (`<1 ms`):** `_fast_rule_route` handles explicit user tier overrides (`"use gemini pro"`, `"use flash lite"`), short confirmations (`"lgtm"`, `"ship it"`), concurrency/crash markers (`"race condition"`, `"deadlock"`, `"segfault"`, `"stack trace"`), and short Turn 2+ continuations (`<= 5` words or `_THREAD_CONTINUATIONS`).
   - **Tier 1 (`gemini-decision-1`, `1.5s` hook budget, `0` output tokens):** Evaluates `task_class` (`choice`), `needs_pro_reasoning` (`noul`), and `effort_rubric` (`score`) in a single prefill pass under `hook_timeout_s` (default `1.5s`, configurable via `router_config.json` or `GEMINI_DECISIONS_HOOK_TIMEOUT_S`, clamped to `[0.3, 8.0]`). On transient timeout/quota/unavailable errors, trips a `45s` circuit-breaker (`api_cooldown.json`) and falls back to `<1 ms` `_lexical_fallback_route` so user turns never stall.
-- **Per-message tool-loop deduplication (`<1 ms` on Steps 2..N):** Records `(conversationId, prompt_hash)` in `seen_turn_<conv>.json` (`600s` TTL). Within a multi-step agent tool loop where `lastUserInput` stays constant across Steps 2..N, `PreInvocation` short-circuits in `<1 ms` and returns `{}` with zero extra API calls and zero duplicate banners. Switched turns use `reroute_<conv>.json` (`600s` TTL) to render their switched banner once on Step 2 and return `{}` on Steps 3..N.
+- **Per-message tool-loop deduplication & `GEMINI_DECISIONS_PRE_ROUTED` handoff (`<1 ms`):** Records `(conversationId, prompt_hash)` in `seen_turn_<conv>.json` (`600s` TTL). Within a multi-step agent tool loop where `lastUserInput` stays constant across Steps 2..N, `PreInvocation` short-circuits in `<1 ms` and returns `{}` with zero extra API calls and zero duplicate banners. When launched via `agyr` (`launch`/`run`) or `agy-router chat`, `GEMINI_DECISIONS_PRE_ROUTED` passes the Turn-1 route digest so `PreInvocation` seeds `thread_<conv>.json`, `active_turn_<conv>.json`, and `seen_turn_<conv>.json` without calling `route_fn` (`0` duplicate API calls and `0` duplicate telemetry entries). Switched Desktop App turns use `reroute_<conv>.json` (`600s` TTL) to render their switched banner once on Step 2 and return `{}` on Steps 3..N.
 - **Asymmetric Turn 2+ thread floor (`enable_thread_floor`):** Persists `thread_<conv>.json` (`7d` TTL) for coding, data, docs, and architecture turns (`locked_task_class != "quick_lookup"`) and runs `_apply_thread_floor` on Turn 2+ so brief follow-ups (`"yes go ahead"`, `"do step 2 next"`) never downgrade an active higher-tier session (`pro` -> `flash_lite`), while standalone high-confidence (`>0.85`) `quick_lookup` questions cleanly unlock back to `flash_lite`.
 - **Inline `"✦ Routed with Intent"` banners across Desktop App & `agy` CLI (`silent`, `compact`, `normal`, `verbose`):**
   - On the Antigravity Desktop App, injects `injectSteps` containing `"systemMessage": ""` (`0` model context tokens) and `renderInfo` (never attach a string `"metadata"` value on `HookSystemMessage`, which triggers a protobuf scrubber type-mismatch panic in Antigravity).
@@ -107,10 +108,21 @@ python3 -m pytest -v tests/test_external_plugin.py
 agy plugin validate . --strict
 ```
 
-### 3. Local Install & `agy-router` CLI Workflows
+### 3. Local Install & `agyr` / `agy-router` CLI Workflows
 ```bash
-# Install plugin into ~/.gemini/config/plugins/gemini-decisions-router and CLI into ~/.local/bin/agy-router
+# Install plugin (including agents/intent-router.md and rules/AGENTS.md) and ~/.local/bin/{agy-router,agyr}
 ./install.sh
+
+# Launch agy with automatic pre-exec model + effort routing (or --dry-run JSON plan)
+agyr "Refactor this FastAPI endpoint to validate pagination parameters"
+agyr -p "What is 2+2?"
+agyr                                     # Bare TUI mode: agy --agent intent-router --effort low
+agy-router run --dry-run -p "What is 2+2?"
+
+# Multi-turn terminal REPL switching --model and --effort across turns (/new, /exit)
+agy-router chat
+agy-router chat --conversation <conversation-id>
+agy --agent intent-router
 
 # Inspect router config, auth mode, Language Server status, and active tier models
 agy-router status

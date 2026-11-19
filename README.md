@@ -1,12 +1,16 @@
 # Gemini Decisions Router for Antigravity
 
-A zero-dependency Antigravity plugin, CLI (`agy-router`), and MCP server that routes prompts and subagent tasks using the **Gemini Decisions API** (`gemini-decision-1`).
+A zero-dependency Antigravity plugin, routed CLI launcher (`agyr` and `agy-router`), custom `intent-router` agent, and MCP server that routes prompts and subagent tasks using the **Gemini Decisions API** (`gemini-decision-1`).
 
 Traditional LLM routers generate JSON text token-by-token, adding 400 to 1,500 ms of decoding latency and brittle string parsing before an agent even starts work. The Gemini Decisions API evaluates your prompt in **one prefill pass with zero output tokens**, returning calibrated probabilities and confidence scores across yes/no (`noul`), multiple-choice (`choice`), and rubric (`score`) questions in roughly 120 to 250 ms.
 
 ## Key Capabilities
 
-- **Frictionless Install & `agy-router` CLI:** `./install.sh` installs the plugin into `~/.gemini/config/plugins/gemini-decisions-router`, creates the `~/.local/bin/agy-router` CLI command, and validates the package with `agy plugin validate --strict`.
+- **Frictionless Install & `agyr` / `agy-router` CLI:** `./install.sh` installs the plugin (including `agents/intent-router.md` and `rules/AGENTS.md`) into `~/.gemini/config/plugins/gemini-decisions-router`, creates both `~/.local/bin/agy-router` and the top-level `~/.local/bin/agyr` auto-switching launcher, and validates the package with `agy plugin validate --strict`.
+- **Top-Level `agy` CLI Auto-Switching (`agyr`, `agy-router chat`, `intent-router`):**
+  - **Single-command auto-switching (`agyr "prompt"` / `agyr -p "prompt"`):** Scores your prompt before launching `agy`, resolves the best installed CLI `--model` and sibling `--effort` (`low`, `medium`, `high`, `max`), logs `SWITCH` telemetry, and hands off `GEMINI_DECISIONS_PRE_ROUTED` so `PreInvocation` runs in `0 ms` with zero duplicate API calls.
+  - **Multi-turn CLI REPL (`agy-router chat`):** Evaluates every turn with `route_prompt` + Turn 2+ thread floor protection and hops across `flash_lite`, `flash`, and `pro` CLI models (`--model` + `--effort`) while preserving conversation continuity (`--continue` / `--conversation`).
+  - **Native TUI Main Agent (`agyr` bare or `agy --agent intent-router`):** Launches the interactive `agy` TUI on `flash_lite` (`--effort low`) to answer quick lookups instantaneously in-turn while delegating multi-file coding, docs, data, and architecture work via `invoke_subagent(TypeName="self", Model="inherit")` so `PreToolUse` dynamically assigns `flash` or `pro`.
 - **Reliable Auth Across Desktop App & `agy` CLI:** Supports keyless OAuth2 Application Default Credentials (`gemini_adc` or `vertex_adc`) and `GEMINI_API_KEY`. Run `agy-router auth-setup --from-env` (or `--api-key-stdin`) once to write a `0600`-permissioned `~/.config/gemini-decisions-router/.env` file so both the GUI-launched Antigravity Desktop App and `agy` CLI resolve credentials without shell inheritance pitfalls.
 - **2-Tier Calibrated Prompt Routing (`PreInvocation`):**
   - **Tier 0 (`<1 ms`):** Instant local fast rules handle confirmations (`"ship it"`, `"lgtm"`), explicit model requests (`"use gemini pro"`), crash markers, Turn 2+ thread continuations, and multi-step tool-loop deduplication.
@@ -83,7 +87,7 @@ See [docs/AUTHENTICATION_ADC.md](docs/AUTHENTICATION_ADC.md) for credential chai
 
 ## Quick Start (Keyless ADC)
 
-### 1. Install the Plugin and `agy-router` CLI
+### 1. Install the Plugin and `agyr` / `agy-router` CLIs
 
 ```bash
 git clone https://github.com/YOUR_ORG/gemini-decisions-router.git
@@ -93,8 +97,8 @@ chmod +x install.sh
 ```
 
 `./install.sh` performs three steps:
-1. Verifies Python 3.11+ and copies all plugin manifests, engine, MCP server, hooks, logo, and skill into `~/.gemini/config/plugins/gemini-decisions-router` (override with `ANTIGRAVITY_PLUGINS_DIR`).
-2. Installs the executable `agy-router` CLI wrapper into `~/.local/bin/agy-router` (override with `BIN_DIR`; ensure `~/.local/bin` is on your `PATH`).
+1. Verifies Python 3.11+ and copies all plugin manifests, engine, MCP server, hooks, custom `intent-router` agent (`agents/intent-router.md`), contributor rules (`rules/AGENTS.md`), logo, and skill into `~/.gemini/config/plugins/gemini-decisions-router` (override with `ANTIGRAVITY_PLUGINS_DIR`).
+2. Installs both executable CLI wrappers into `~/.local/bin/agy-router` and `~/.local/bin/agyr` (override with `BIN_DIR`; ensure `~/.local/bin` is on your `PATH`).
 3. Automatically runs `agy plugin validate ~/.gemini/config/plugins/gemini-decisions-router --strict` when `agy` is installed.
 
 ### 2. Enable the API and Configure Workstation ADC
@@ -225,6 +229,54 @@ agy-router set-mode auto_switch --min-confidence 0.55
 agy-router set-mode off
 ```
 
+## Top-Level `agy` CLI Auto-Switching (`agyr`, `agy-router chat`, `intent-router`)
+
+Because standalone `agy` CLI spawns an ephemeral Language Server per session, the plugin provides three native CLI entrypoints that auto-switch `--model` and `--effort` directly on `agy`:
+
+### 1. `agyr` (`agy-router launch` / `agy-router run`)
+
+Scores your prompt via `gemini-decision-1` before `exec`ing `agy`, resolves the best installed CLI `--model` and sibling `--effort` (`low`, `medium`, `high`, `max`), prints the `AUTO-SWITCHED` banner to `stderr`, and exports `GEMINI_DECISIONS_PRE_ROUTED` so the child `PreInvocation` hook seeds conversation state in `0 ms` with zero duplicate API calls:
+
+```bash
+# Interactive session (-i) launched on the calibrated CLI --model and --effort
+agyr "Refactor this FastAPI endpoint to validate pagination parameters"
+
+# Headless print mode (-p) with automatic CLI model + effort selection
+agyr -p "What is 2+2?"
+agyr -p "Design a lock-free ring buffer memory ordering proof in C++20"
+
+# Inspect the resolved CLI plan as JSON without launching agy
+agy-router run --dry-run -p "What is 2+2?"
+
+# Explicit --model or resume-only (-c / --conversation) passes straight through untouched
+agyr --model gemini-3-flash -p "Summarize git status"
+agyr -c
+```
+
+### 2. Multi-Turn CLI REPL (`agy-router chat`)
+
+Runs an interactive terminal REPL that re-scores each user turn (`user_turn_count=1..N`), preserves conversation continuity (`--continue` / `--conversation`), enforces the asymmetric Turn 2+ thread floor (`enable_thread_floor`), and hops across `flash_lite`, `flash`, and `pro` CLI models per turn:
+
+```bash
+# Start a multi-turn routed terminal chat (/new or /reset to clear thread, /exit to quit)
+agy-router chat
+
+# Resume a specific existing agy conversation ID with per-turn model switching
+agy-router chat --conversation <conversation-id>
+```
+
+### 3. Native TUI Intent-Routed Main Agent (`agyr` bare or `agy --agent intent-router`)
+
+Running bare `agyr` (with no prompt and no `-c`) or `agy --agent intent-router` starts the full interactive `agy` TUI using `agents/intent-router.md` (`mainAgent: true`, `subagent: false`) on `flash_lite` (`--effort low`):
+- Lightweight `quick_lookup` turns, status checks, and single-step questions are answered directly in-turn with zero delegation overhead.
+- Substantive `coding_edit`, `writing_docs`, `data_analysis`, and `deep_debug_architecture` tasks are delegated via `invoke_subagent(TypeName="self", Model="inherit")`, allowing the `PreToolUse` hook to dynamically assign `flash` or `pro` inside the native TUI.
+
+```bash
+agyr
+# Equivalent explicit TUI invocation:
+agy --agent intent-router
+```
+
 ## Dynamic Model Auto-Discovery & Configurable Target Models
 
 In addition to the 10 built-in target models (across Gemini 3.1/3/2.5, Claude Sonnet/Opus 4.6, and GPT-OSS), the router dynamically discovers newly released models directly from your local Antigravity Language Server (`GetAvailableModels`) and `agy models` CLI at runtime:
@@ -343,11 +395,12 @@ agy plugin validate . --strict
 ## Repository Layout
 
 - `rules/AGENTS.md`: Contributor architecture map, security/hermeticity invariants, hook/MCP contracts, and TDD/benchmark commands (`trigger: model_decision`)
+- `agents/intent-router.md`: Custom Markdown main agent (`agy --agent intent-router`) for lightweight in-turn answers and `PreToolUse`-calibrated `invoke_subagent` delegation
 - `plugin.json`, `mcp_config.json`, `hooks.json`: Antigravity plugin (`category: "agents"`), MCP, and hook manifests
-- `install.sh`: Installer for `~/.gemini/config/plugins/gemini-decisions-router`, `~/.local/bin/agy-router`, and `agy plugin validate --strict`
-- `decisions_engine.py`: Keyless ADC resolver, `0600` `.env` loader, Decisions HTTP client, input/file security validator, dynamic Antigravity / `agy` model auto-discovery, and 2-tier router
+- `install.sh`: Installer for `~/.gemini/config/plugins/gemini-decisions-router`, `~/.local/bin/agy-router`, `~/.local/bin/agyr`, and `agy plugin validate --strict`
+- `decisions_engine.py`: Keyless ADC resolver, `0600` `.env` loader, Decisions HTTP client, input/file security validator, dynamic Antigravity / `agy` model auto-discovery, CLI sibling target resolver, and 2-tier router
 - `mcp_server.py`: Stdio JSON-RPC 2.0 MCP server (`create_decision`, `route_prompt`, `list_models`, `configure_router`)
-- `router_hook.py`: `PreInvocation` / `PreToolUse` hooks and `agy-router` CLI (`auth-setup`, `auth-check`, `status`, `route`, `watch`, `stats`, `set-mode`, `set-verbosity`, `list-models`, `sync-models`, `set-models`)
+- `router_hook.py`: `PreInvocation` / `PreToolUse` hooks, `GEMINI_DECISIONS_PRE_ROUTED` handoff, and `agyr` / `agy-router` CLI (`launch`, `run`, `chat`, `auth-setup`, `auth-check`, `status`, `route`, `watch`, `stats`, `set-mode`, `set-verbosity`, `list-models`, `sync-models`, `set-models`)
 - `skills/gemini-decisions-router/SKILL.md`: Agent skill reference loaded by Antigravity
 - `docs/CUSTOMER_ONBOARDING.md`: Enterprise Google Cloud customer rollout guide
 - `docs/AUTHENTICATION_ADC.md`: Keyless ADC architecture and troubleshooting guide
