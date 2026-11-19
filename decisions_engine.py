@@ -2381,8 +2381,51 @@ def _resolve_agy_binary(agy_bin: str | None) -> str:
   return ""
 
 
+def _is_custom_agy_bin(agy_bin: str | None) -> bool:
+  if agy_bin is None:
+    return False
+  cand = str(agy_bin).strip()
+  if not cand:
+    return False
+  resolved_cand = _resolve_agy_binary(cand)
+  default_bin = _resolve_agy_binary(None)
+  if not resolved_cand or not default_bin:
+    return True
+  try:
+    return os.path.realpath(resolved_cand) != os.path.realpath(default_bin)
+  except OSError:
+    return resolved_cand != default_bin
+
+
+def _query_agy_cli_models(agy_bin: str | None) -> list[dict[str, Any]]:
+  """Runs `agy models` and returns normalized `discovered_cli` entries."""
+  agy_path = _resolve_agy_binary(agy_bin)
+  if not agy_path:
+    return []
+  try:
+    proc = subprocess.run(
+        [agy_path, "models"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=8.0,
+        check=False,
+    )
+    if proc.returncode == 0:
+      cli_models = parse_agy_models_output(proc.stdout or "")
+      if not cli_models and proc.stderr:
+        cli_models = parse_agy_models_output(proc.stderr)
+      return cli_models
+  except (OSError, subprocess.SubprocessError):
+    pass
+  return []
+
+
 def _write_discovered_cache(
-    cache_file: pathlib.Path, models: list[dict[str, Any]]
+    cache_file: pathlib.Path,
+    models: list[dict[str, Any]],
+    *,
+    cli_checked: bool = False,
 ) -> None:
   try:
     cache_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2397,7 +2440,11 @@ def _write_discovered_cache(
     except FileNotFoundError:
       pass
     payload = json.dumps(
-        {"updated_at": time.time(), "models": models},
+        {
+            "updated_at": time.time(),
+            "cli_checked": cli_checked,
+            "models": models,
+        },
         indent=2,
         ensure_ascii=False,
     ).encode("utf-8") + b"\n"
@@ -2429,6 +2476,10 @@ def discover_installed_models(
     run_cli_fallback: bool = True,
 ) -> list[dict[str, Any]]:
   """Discovers models from cache, Antigravity LS, and optional `agy models` CLI."""
+  if cache_path is None and _is_custom_agy_bin(agy_bin):
+    cli_only = _query_agy_cli_models(agy_bin) if run_cli_fallback else []
+    return propagate_sibling_model_enums(cli_only, seed_enums=MODEL_ENUMS)
+
   cpath = (
       pathlib.Path(cache_path).expanduser()
       if cache_path is not None
@@ -2451,32 +2502,24 @@ def discover_installed_models(
                 if norm is not None and norm["id"] not in seen_cached:
                   seen_cached.add(norm["id"])
                   cached_out.append(norm)
-            return propagate_sibling_model_enums(
-                cached_out, seed_enums=MODEL_ENUMS
+            needs_cli_upgrade = (
+                run_cli_fallback
+                and cache_path is None
+                and not bool(data.get("cli_checked"))
+                and not any(
+                    m.get("source") == "discovered_cli" for m in cached_out
+                )
+                and bool(_resolve_agy_binary(agy_bin))
             )
+            if not needs_cli_upgrade:
+              return propagate_sibling_model_enums(
+                  cached_out, seed_enums=MODEL_ENUMS
+              )
     except (OSError, ValueError, TypeError):
       pass
 
   ls_models, ls_enum_hints = _query_ls_models_and_hints()
-  cli_models: list[dict[str, Any]] = []
-  if run_cli_fallback:
-    agy_path = _resolve_agy_binary(agy_bin)
-    if agy_path:
-      try:
-        proc = subprocess.run(
-            [agy_path, "models"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=8.0,
-            check=False,
-        )
-        if proc.returncode == 0:
-          cli_models = parse_agy_models_output(proc.stdout or "")
-          if not cli_models and proc.stderr:
-            cli_models = parse_agy_models_output(proc.stderr)
-      except (OSError, subprocess.SubprocessError):
-        cli_models = []
+  cli_models = _query_agy_cli_models(agy_bin) if run_cli_fallback else []
 
   merged_by_id: dict[str, dict[str, Any]] = {}
   ordered_ids: list[str] = []
@@ -2521,7 +2564,9 @@ def discover_installed_models(
       seed_enums={**MODEL_ENUMS, **ls_enum_hints},
   )
   if merged:
-    _write_discovered_cache(cpath, merged)
+    _write_discovered_cache(
+        cpath, merged, cli_checked=bool(run_cli_fallback)
+    )
   return merged
 
 
@@ -2765,7 +2810,111 @@ def list_available_target_models(
       "env_overrides": env_overrides,
       "available_target_models": models,
   }
+
+
 THINKING_LABELS = {1: "Low", 2: "Medium", 3: "High", 4: "Max"}
+THINKING_EFFORT_FLAGS: dict[int, str] = {
+    1: "low",
+    2: "medium",
+    3: "high",
+    4: "max",
+}
+
+
+def resolve_cli_launch_target(
+    route: Mapping[str, Any],
+    *,
+    tier_models: Mapping[str, str] | None = None,
+    discovered_models: Sequence[Mapping[str, Any]] | None = None,
+    discovered_cache_path: str | os.PathLike[str] | None = None,
+    agy_bin: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+  """Resolves a CLI-accepted `--model` ID and sibling `--effort` flag for `agy`."""
+  if discovered_models is not None:
+    raw_discovered: Sequence[Mapping[str, Any]] = [
+        m for m in discovered_models if isinstance(m, Mapping)
+    ]
+  elif (
+      environ is not None
+      and discovered_cache_path is None
+      and agy_bin is None
+  ):
+    raw_discovered = []
+  else:
+    raw_discovered = discover_installed_models(
+        agy_bin=agy_bin,
+        cache_path=discovered_cache_path,
+        run_cli_fallback=True,
+    )
+
+  discovered: list[dict[str, Any]] = []
+  seen_ids: set[str] = set()
+  for entry in raw_discovered:
+    norm = _normalize_cached_model_entry(entry)
+    if norm is not None and norm["id"] not in seen_ids:
+      seen_ids.add(norm["id"])
+      discovered.append(norm)
+
+  cli_only = [m for m in discovered if m.get("source") == "discovered_cli"]
+  cli_models = cli_only if cli_only else discovered
+  cli_model_ids = {str(m["id"]) for m in cli_models}
+
+  raw_tier = str(
+      route.get("subagent_tier") or route.get("recommended_tier") or "flash"
+  ).strip()
+  tier = raw_tier if raw_tier in TIER_RANKS else "flash"
+  try:
+    raw_think = route.get("thinking_level")
+    parsed_think = (
+        int(raw_think)
+        if raw_think is not None
+        and raw_think != ""
+        and not isinstance(raw_think, bool)
+        else 2
+    )
+    thinking_level = max(1, min(4, parsed_think if parsed_think else 2))
+  except (TypeError, ValueError):
+    thinking_level = 2
+  effort = THINKING_EFFORT_FLAGS[thinking_level]
+
+  rec_mid = str(route.get("recommended_model_id") or "").strip()
+  if not rec_mid or rec_mid == "auto":
+    rec_mid = resolve_tier_models(tier_models, environ=environ)[tier]
+  original_id = rec_mid
+
+  chosen_id = original_id
+  if cli_models and chosen_id not in cli_model_ids:
+    suggested = suggest_tier_models(cli_models).get(tier, "")
+    if suggested and suggested in cli_model_ids:
+      chosen_id = suggested
+    else:
+      tier_match = next(
+          (str(m["id"]) for m in cli_models if m.get("tier") == tier),
+          "",
+      )
+      chosen_id = tier_match or str(cli_models[0]["id"])
+
+  final_id = chosen_id
+  if cli_model_ids and chosen_id:
+    base_id = _THINKING_VARIANT_SUFFIX_RE.sub("", chosen_id)
+    sibling_candidates = (
+        (f"{base_id}-max", f"{base_id}-xhigh", f"{base_id}-high")
+        if effort == "max"
+        else (f"{base_id}-{effort}",)
+    )
+    for cand in sibling_candidates:
+      if cand in cli_model_ids:
+        final_id = cand
+        break
+
+  return {
+      "model_id": final_id,
+      "effort": effort,
+      "tier": tier,
+      "thinking_level": thinking_level,
+      "fallback_from": original_id if final_id != original_id else "",
+  }
 
 _SHORT_CONFIRMATIONS = frozenset({
     "yes",
