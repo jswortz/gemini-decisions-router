@@ -2295,14 +2295,14 @@ def _resolve_cli_target_for_session(
 
   explicit_state = os.environ.get("GEMINI_DECISIONS_STATE_DIR", "").strip()
   explicit_cfg = os.environ.get("GEMINI_DECISIONS_ROUTER_CONFIG", "").strip()
-  cpath = (
+  explicit_cpath = (
       (pathlib.Path(explicit_state) / "discovered_models.json")
       if explicit_state
-      else _default_discovered_models_path()
+      else None
   )
-  if (explicit_state or explicit_cfg) and not cpath.is_file() and not (
-      os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip()
-  ):
+  if (explicit_state or explicit_cfg) and (
+      explicit_cpath is None or not explicit_cpath.is_file()
+  ) and not os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip():
     return _resolve_cli_launch_target_compat(
         route,
         tier_models=cfg.get("tier_models"),
@@ -2311,7 +2311,7 @@ def _resolve_cli_target_for_session(
   return _resolve_cli_launch_target_compat(
       route,
       tier_models=cfg.get("tier_models"),
-      discovered_cache_path=cpath,
+      discovered_cache_path=explicit_cpath,
       agy_bin=agy_bin,
   )
 

@@ -1869,6 +1869,7 @@ def test_benchmark_suite_dataset_mock_runner_and_live_results(
 def test_docs_contain_no_em_or_en_dashes() -> None:
   doc_paths = [
       REPO_ROOT / "README.md",
+      REPO_ROOT / "agents" / "intent-router.md",
       REPO_ROOT / "rules" / "AGENTS.md",
       REPO_ROOT / "docs" / "BENCHMARKS.md",
       REPO_ROOT / "docs" / "CUSTOMER_ONBOARDING.md",
@@ -2505,3 +2506,638 @@ def test_large_trajectory_ls_rpc_sibling_enum_propagation_and_proc_discovery(
   assert resolved["gemini-5.0-flash-high"] == "MODEL_PLACEHOLDER_M999"
   assert resolved["gemini-5.0-flash-xhigh"] == "MODEL_PLACEHOLDER_M999"
   assert resolved["gemini-5.0-flash-max"] == "MODEL_PLACEHOLDER_M999"
+
+
+def test_resolve_cli_launch_target_and_sibling_effort_matching() -> None:
+  """Verifies CLI model validation, fallback to discovered_cli, and sibling effort swapping."""
+  assert decisions_engine.THINKING_EFFORT_FLAGS == {
+      1: "low",
+      2: "medium",
+      3: "high",
+      4: "max",
+  }
+
+  # 1. Hermetic mode (`environ={}` with no cache/agy_bin) avoids disk/subprocess I/O
+  hermetic = decisions_engine.resolve_cli_launch_target(
+      {
+          "subagent_tier": "flash_lite",
+          "recommended_model_id": "gemini-3.1-flash-lite",
+          "thinking_level": 1,
+      },
+      environ={},
+  )
+  assert hermetic == {
+      "model_id": "gemini-3.1-flash-lite",
+      "effort": "low",
+      "tier": "flash_lite",
+      "thinking_level": 1,
+      "fallback_from": "",
+  }
+
+  # 2. Mixed LS-only + CLI models: excludes LS-only IDs and maps static IDs to discovered_cli
+  discovered = [
+      {
+          "id": "gemini-pro-orchestrator-ls-only",
+          "label": "Gemini Pro Orchestrator (LS Only)",
+          "tier": "pro",
+          "enum": "MODEL_LS_ONLY_ORCH",
+          "default_thinking_level": 4,
+          "source": "discovered_ls",
+      },
+      {
+          "id": "gemini-5.0-flash-low",
+          "label": "Gemini 5.0 Flash (Low)",
+          "tier": "flash_lite",
+          "default_thinking_level": 1,
+          "source": "discovered_cli",
+      },
+      {
+          "id": "gemini-5.0-flash-medium",
+          "label": "Gemini 5.0 Flash (Medium)",
+          "tier": "flash",
+          "default_thinking_level": 2,
+          "source": "discovered_cli",
+      },
+      {
+          "id": "gemini-5.0-flash-high",
+          "label": "Gemini 5.0 Flash (High)",
+          "tier": "flash",
+          "default_thinking_level": 3,
+          "source": "discovered_cli",
+      },
+      {
+          "id": "gemini-5.0-pro-low",
+          "label": "Gemini 5.0 Pro (Low)",
+          "tier": "pro",
+          "default_thinking_level": 2,
+          "source": "discovered_cli",
+      },
+      {
+          "id": "gemini-5.0-pro-high",
+          "label": "Gemini 5.0 Pro (High)",
+          "tier": "pro",
+          "default_thinking_level": 3,
+          "source": "discovered_cli",
+      },
+      {
+          "id": "gemini-5.0-pro-xhigh",
+          "label": "Gemini 5.0 Pro (XHigh)",
+          "tier": "pro",
+          "default_thinking_level": 4,
+          "source": "discovered_cli",
+      },
+  ]
+
+  # Non-CLI static model ID (`gemini-3.1-flash-lite`) falls back to `gemini-5.0-flash-low`
+  t_lite = decisions_engine.resolve_cli_launch_target(
+      {
+          "subagent_tier": "flash_lite",
+          "recommended_model_id": "gemini-3.1-flash-lite",
+          "thinking_level": 1,
+      },
+      discovered_models=discovered,
+      environ={},
+  )
+  assert t_lite == {
+      "model_id": "gemini-5.0-flash-low",
+      "effort": "low",
+      "tier": "flash_lite",
+      "thinking_level": 1,
+      "fallback_from": "gemini-3.1-flash-lite",
+  }
+
+  # LS-only model ID (`gemini-pro-orchestrator-ls-only`) is rejected in favor of CLI model
+  t_ls_rejected = decisions_engine.resolve_cli_launch_target(
+      {
+          "subagent_tier": "pro",
+          "recommended_model_id": "gemini-pro-orchestrator-ls-only",
+          "thinking_level": 3,
+      },
+      discovered_models=discovered,
+      environ={},
+  )
+  assert t_ls_rejected["model_id"] == "gemini-5.0-pro-high"
+  assert t_ls_rejected["effort"] == "high"
+  assert t_ls_rejected["fallback_from"] == "gemini-pro-orchestrator-ls-only"
+
+  # 3. Sibling suffix swapping across thinking_level 1..4
+  t_lvl1 = decisions_engine.resolve_cli_launch_target(
+      {
+          "subagent_tier": "flash",
+          "recommended_model_id": "gemini-5.0-flash-medium",
+          "thinking_level": 1,
+      },
+      discovered_models=discovered,
+      environ={},
+  )
+  assert t_lvl1["model_id"] == "gemini-5.0-flash-low"
+  assert t_lvl1["effort"] == "low"
+  assert t_lvl1["fallback_from"] == "gemini-5.0-flash-medium"
+
+  t_lvl2 = decisions_engine.resolve_cli_launch_target(
+      {
+          "subagent_tier": "flash",
+          "recommended_model_id": "gemini-3-flash",
+          "thinking_level": 2,
+      },
+      discovered_models=discovered,
+      environ={},
+  )
+  assert t_lvl2["model_id"] == "gemini-5.0-flash-medium"
+  assert t_lvl2["effort"] == "medium"
+  assert t_lvl2["fallback_from"] == "gemini-3-flash"
+
+  t_lvl3 = decisions_engine.resolve_cli_launch_target(
+      {
+          "subagent_tier": "flash",
+          "recommended_model_id": "gemini-5.0-flash-medium",
+          "thinking_level": 3,
+      },
+      discovered_models=discovered,
+      environ={},
+  )
+  assert t_lvl3["model_id"] == "gemini-5.0-flash-high"
+  assert t_lvl3["effort"] == "high"
+  assert t_lvl3["fallback_from"] == "gemini-5.0-flash-medium"
+
+  # Level 4 (`max`) selects `-xhigh` when `-max` is absent
+  t_lvl4_xhigh = decisions_engine.resolve_cli_launch_target(
+      {
+          "subagent_tier": "pro",
+          "recommended_model_id": "gemini-5.0-pro-high",
+          "thinking_level": 4,
+      },
+      discovered_models=discovered,
+      environ={},
+  )
+  assert t_lvl4_xhigh["model_id"] == "gemini-5.0-pro-xhigh"
+  assert t_lvl4_xhigh["effort"] == "max"
+  assert t_lvl4_xhigh["fallback_from"] == "gemini-5.0-pro-high"
+
+  # Level 4 (`max`) falls back to `-high` when neither `-max` nor `-xhigh` exists
+  discovered_no_xhigh = [
+      m for m in discovered if m["id"] != "gemini-5.0-pro-xhigh"
+  ]
+  t_lvl4_high = decisions_engine.resolve_cli_launch_target(
+      {
+          "subagent_tier": "pro",
+          "recommended_model_id": "gemini-3.1-pro-high",
+          "thinking_level": 4,
+      },
+      discovered_models=discovered_no_xhigh,
+      environ={},
+  )
+  assert t_lvl4_high["model_id"] == "gemini-5.0-pro-high"
+  assert t_lvl4_high["effort"] == "max"
+  assert t_lvl4_high["fallback_from"] == "gemini-3.1-pro-high"
+
+
+def test_agyr_launcher_modes_and_pre_routed_handoff(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Verifies agyr launch modes, install.sh artifacts, and 0-call pre-routed handoff."""
+  state_dir = tmp_path / "state"
+  state_dir.mkdir(parents=True)
+  cfg_path = tmp_path / "router_config.json"
+  router_hook.save_router_config(
+      {"mode": "auto_switch", "verbosity": "normal", "cli_inline_banner": True},
+      config_path=cfg_path,
+  )
+
+  # Seed synthetic CLI models in isolated state_dir cache
+  cache_payload = {
+      "updated_at": 9999999999.0,
+      "cli_checked": True,
+      "models": [
+          {
+              "id": "gemini-5.0-flash-low",
+              "label": "Gemini 5.0 Flash (Low)",
+              "tier": "flash_lite",
+              "default_thinking_level": 1,
+              "source": "discovered_cli",
+          },
+          {
+              "id": "gemini-5.0-flash-medium",
+              "label": "Gemini 5.0 Flash (Medium)",
+              "tier": "flash",
+              "default_thinking_level": 2,
+              "source": "discovered_cli",
+          },
+          {
+              "id": "gemini-5.0-pro-high",
+              "label": "Gemini 5.0 Pro (High)",
+              "tier": "pro",
+              "default_thinking_level": 3,
+              "source": "discovered_cli",
+          },
+      ],
+  }
+  (state_dir / "discovered_models.json").write_text(
+      json.dumps(cache_payload), encoding="utf-8"
+  )
+
+  fake_agy = tmp_path / "fake-agy"
+  fake_agy.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+  fake_agy.chmod(0o755)
+
+  env = dict(os.environ)
+  env["HOME"] = str(tmp_path)
+  env["GEMINI_DECISIONS_STATE_DIR"] = str(state_dir)
+  env["GEMINI_DECISIONS_ROUTER_CONFIG"] = str(cfg_path)
+  env.pop("ANTIGRAVITY_LS_ADDRESS", None)
+
+  def run_launch_dry(*extra_args: str) -> dict[str, Any]:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            str(REPO_ROOT / "router_hook.py"),
+            "launch",
+            "--dry-run",
+            "--agy-bin",
+            str(fake_agy),
+            *extra_args,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=8.0,
+        check=True,
+    )
+    return json.loads(proc.stdout)
+
+  # 1. `agyr "prompt"` -> interactive `-i` with calibrated model + effort
+  plan_interactive = run_launch_dry("ship it")
+  assert plan_interactive["action"] == "route_interactive"
+  assert plan_interactive["agy_cmd"] == [
+      str(fake_agy),
+      "--model",
+      "gemini-5.0-flash-low",
+      "--effort",
+      "low",
+      "-i",
+      "ship it",
+  ]
+  assert plan_interactive["pre_routed"]["inject_cli_badge"] is False
+
+  # 2. `agyr -p "prompt"` -> print `-p` routing to pro + high effort
+  plan_print = run_launch_dry(
+      "-p", "Investigate a deadlock and race condition in the worker pool"
+  )
+  assert plan_print["action"] == "route_print"
+  assert plan_print["agy_cmd"] == [
+      str(fake_agy),
+      "--model",
+      "gemini-5.0-pro-high",
+      "--effort",
+      "high",
+      "-p",
+      "Investigate a deadlock and race condition in the worker pool",
+  ]
+  assert plan_print["target"]["tier"] == "pro"
+
+  # 3. Bare `agyr` -> launches `--agent intent-router` on `flash_lite` (`--effort low`)
+  plan_bare = run_launch_dry()
+  assert plan_bare["action"] == "launch_tui_intent_router"
+  assert plan_bare["agy_cmd"] == [
+      str(fake_agy),
+      "--agent",
+      "intent-router",
+      "--model",
+      "gemini-5.0-flash-low",
+      "--effort",
+      "low",
+  ]
+
+  # 4. Explicit `--model` passthrough -> untouched
+  plan_explicit = run_launch_dry(
+      "--model", "claude-sonnet-4-6", "-p", "Explain this snippet"
+  )
+  assert plan_explicit["action"] == "passthrough_explicit_model"
+  assert plan_explicit["route"] is None
+  assert plan_explicit["agy_cmd"] == [
+      str(fake_agy),
+      "--model",
+      "claude-sonnet-4-6",
+      "-p",
+      "Explain this snippet",
+  ]
+
+  # 5. `./install.sh` creates executable `agyr` + `agy-router` + `agents/intent-router.md` + `rules/AGENTS.md`
+  plugins_dir = tmp_path / "plugins"
+  bin_dir = tmp_path / "bin"
+  install_env = dict(env)
+  install_env["ANTIGRAVITY_PLUGINS_DIR"] = str(plugins_dir)
+  install_env["BIN_DIR"] = str(bin_dir)
+  install_env["PATH"] = "/usr/bin:/bin"
+  install_proc = subprocess.run(
+      ["bash", str(REPO_ROOT / "install.sh")],
+      env=install_env,
+      capture_output=True,
+      text=True,
+      timeout=10.0,
+      check=True,
+  )
+  assert "Installed routed agy launcher to:" in install_proc.stdout
+  installed_plugin = plugins_dir / "gemini-decisions-router"
+  assert (installed_plugin / "agents" / "intent-router.md").is_file()
+  assert (installed_plugin / "rules" / "AGENTS.md").is_file()
+  agyr_wrapper = bin_dir / "agyr"
+  agy_router_wrapper = bin_dir / "agy-router"
+  assert agyr_wrapper.is_file() and os.access(agyr_wrapper, os.X_OK)
+  assert agy_router_wrapper.is_file() and os.access(agy_router_wrapper, os.X_OK)
+
+  wrapper_dry = subprocess.run(
+      [str(agyr_wrapper), "--dry-run", "--agy-bin", str(fake_agy), "ship it"],
+      env=env,
+      capture_output=True,
+      text=True,
+      timeout=8.0,
+      check=True,
+  )
+  assert json.loads(wrapper_dry.stdout)["action"] == "route_interactive"
+
+  # 6. `handle_pre_invocation` honors `GEMINI_DECISIONS_PRE_ROUTED` with 0 calls to `route_fn`
+  route_calls = 0
+
+  def forbidden_route_fn(*_a: Any, **_kw: Any) -> dict[str, Any]:
+    nonlocal route_calls
+    route_calls += 1
+    raise AssertionError("route_fn should not be called when pre-routed!")
+
+  prompt_text = "Investigate a deadlock and race condition in the worker pool"
+  monkeypatch.setenv(
+      "GEMINI_DECISIONS_PRE_ROUTED",
+      json.dumps(plan_print["pre_routed"]),
+  )
+  hook_res = router_hook.handle_pre_invocation(
+      {
+          "conversationId": "pre-routed-conv-1",
+          "invocationNum": 0,
+          "modelName": "gemini-5.0-pro-high",
+          "lastUserInput": prompt_text,
+          "transcriptPath": str(
+              tmp_path
+              / ".gemini"
+              / "antigravity-cli"
+              / "brain"
+              / "c1"
+              / "transcript.jsonl"
+          ),
+      },
+      state_dir=state_dir,
+      config_path=cfg_path,
+      route_fn=forbidden_route_fn,
+  )
+  assert route_calls == 0
+  assert hook_res == {}
+  assert not (state_dir / "telemetry.jsonl").exists()
+  seeded_thread = json.loads(
+      router_hook.safe_state_path(
+          state_dir, "pre-routed-conv-1", "thread"
+      ).read_text(encoding="utf-8")
+  )
+  assert seeded_thread["locked_tier"] == "pro"
+  assert seeded_thread["locked_model_id"] == "gemini-5.0-pro-high"
+
+
+def test_agy_router_chat_repl_multi_turn_switching(
+    tmp_path: pathlib.Path,
+) -> None:
+  """Verifies multi-turn REPL hops flash_lite -> pro while keeping conversation continuity."""
+
+  class _ChatDecisionsHandler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+      del fmt, args
+
+    def do_POST(self) -> None:  # pylint: disable=invalid-name
+      length = int(self.headers.get("Content-Length", "0"))
+      body = json.loads(self.rfile.read(length).decode("utf-8"))
+      text = " ".join(
+          str(part.get("text") or "") for part in body.get("input", [])
+      ).lower()
+      if "2+2" in text:
+        resp = {
+            "answers": {
+                "task_class": {
+                    "type": "choice",
+                    "choice": "quick_lookup",
+                    "confidence": 0.96,
+                    "probabilities": {
+                        "quick_lookup": 0.96,
+                        "coding_edit": 0.01,
+                        "writing_docs": 0.01,
+                        "data_analysis": 0.01,
+                        "deep_debug_architecture": 0.01,
+                    },
+                },
+                "needs_pro_reasoning": {
+                    "type": "noul",
+                    "noul": 0.02,
+                    "confidence": 0.97,
+                },
+                "effort_rubric": {
+                    "type": "score",
+                    "score": 0.2,
+                    "confidence": 0.95,
+                    "probabilities": {
+                        "0": 0.85,
+                        "1": 0.10,
+                        "2": 0.03,
+                        "3": 0.02,
+                    },
+                },
+            },
+            "usage": {"total_input_tokens": 24},
+        }
+      else:
+        resp = {
+            "answers": {
+                "task_class": {
+                    "type": "choice",
+                    "choice": "deep_debug_architecture",
+                    "confidence": 0.95,
+                    "probabilities": {
+                        "quick_lookup": 0.01,
+                        "coding_edit": 0.02,
+                        "writing_docs": 0.01,
+                        "data_analysis": 0.01,
+                        "deep_debug_architecture": 0.95,
+                    },
+                },
+                "needs_pro_reasoning": {
+                    "type": "noul",
+                    "noul": 0.96,
+                    "confidence": 0.96,
+                },
+                "effort_rubric": {
+                    "type": "score",
+                    "score": 2.9,
+                    "confidence": 0.94,
+                    "probabilities": {
+                        "0": 0.01,
+                        "1": 0.02,
+                        "2": 0.07,
+                        "3": 0.90,
+                    },
+                },
+            },
+            "usage": {"total_input_tokens": 36},
+        }
+      raw = json.dumps(resp).encode("utf-8")
+      self.send_response(200)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", str(len(raw)))
+      self.end_headers()
+      self.wfile.write(raw)
+
+  server = http.server.HTTPServer(("127.0.0.1", 0), _ChatDecisionsHandler)
+  port = server.server_port
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+
+  try:
+    state_dir = tmp_path / "chat_state"
+    state_dir.mkdir(parents=True)
+    cfg_path = tmp_path / "router_config.json"
+    router_hook.save_router_config(
+        {"mode": "auto_switch", "verbosity": "compact"},
+        config_path=cfg_path,
+    )
+    (state_dir / "discovered_models.json").write_text(
+        json.dumps({
+            "updated_at": 9999999999.0,
+            "cli_checked": True,
+            "models": [
+                {
+                    "id": "gemini-5.0-flash-low",
+                    "label": "Gemini 5.0 Flash (Low)",
+                    "tier": "flash_lite",
+                    "default_thinking_level": 1,
+                    "source": "discovered_cli",
+                },
+                {
+                    "id": "gemini-5.0-flash-medium",
+                    "label": "Gemini 5.0 Flash (Medium)",
+                    "tier": "flash",
+                    "default_thinking_level": 2,
+                    "source": "discovered_cli",
+                },
+                {
+                    "id": "gemini-5.0-pro-high",
+                    "label": "Gemini 5.0 Pro (High)",
+                    "tier": "pro",
+                    "default_thinking_level": 4,
+                    "source": "discovered_cli",
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    invocations_log = tmp_path / "agy_invocations.jsonl"
+    fake_agy = tmp_path / "fake_agy.py"
+    fake_agy.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, subprocess, sys\n"
+        "argv = sys.argv[1:]\n"
+        "conv_id = 'chat-conv-uuid-42'\n"
+        "if '--conversation' in argv:\n"
+        "  conv_id = argv[argv.index('--conversation') + 1]\n"
+        "prompt = argv[argv.index('-p') + 1] if '-p' in argv else ''\n"
+        "model = argv[argv.index('--model') + 1] if '--model' in argv else 'auto'\n"
+        f"hook_res = subprocess.run([{sys.executable!r}, '-B', {str(REPO_ROOT / 'router_hook.py')!r}, 'pre-invocation'],\n"
+        "  input=json.dumps({'conversationId': conv_id, 'invocationNum': 0, 'modelName': model, 'lastUserInput': prompt}),\n"
+        "  text=True, capture_output=True, check=True)\n"
+        f"with open({str(invocations_log)!r}, 'a', encoding='utf-8') as f:\n"
+        "  f.write(json.dumps({'argv': argv, 'conv_id': conv_id, 'hook_out': json.loads(hook_res.stdout or '{}')}) + '\\n')\n"
+        "sys.stdout.write(f'[{model}] ok\\n')\n",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(0o755)
+
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["GEMINI_DECISIONS_STATE_DIR"] = str(state_dir)
+    env["GEMINI_DECISIONS_ROUTER_CONFIG"] = str(cfg_path)
+    env["GEMINI_DECISIONS_AUTH_MODE"] = "api_key"
+    env["GEMINI_API_KEY"] = "mock_chat_repl_key"
+    env["GEMINI_DECISIONS_API_BASE"] = f"http://127.0.0.1:{port}/v1beta"
+    env.pop("ANTIGRAVITY_LS_ADDRESS", None)
+
+    repl_input = (
+        "What is 2+2?\n"
+        "Design a distributed Cloud Spanner failover consensus protocol\n"
+        "/exit\n"
+    )
+    chat_proc = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            str(REPO_ROOT / "router_hook.py"),
+            "chat",
+            "--agy-bin",
+            str(fake_agy),
+        ],
+        input=repl_input,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15.0,
+        check=True,
+    )
+
+    calls = [
+        json.loads(line)
+        for line in invocations_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 2
+
+    # Turn 1: fresh launch on flash_lite (`gemini-5.0-flash-low`, `--effort low`)
+    assert calls[0]["argv"] == [
+        "--model",
+        "gemini-5.0-flash-low",
+        "--effort",
+        "low",
+        "-p",
+        "What is 2+2?",
+    ]
+    assert calls[0]["hook_out"] == {}
+
+    # Turn 2: hops to pro (`gemini-5.0-pro-high`, `--effort max`) while resuming `chat-conv-uuid-42`
+    assert calls[1]["argv"] == [
+        "--conversation",
+        "chat-conv-uuid-42",
+        "--model",
+        "gemini-5.0-pro-high",
+        "--effort",
+        "max",
+        "-p",
+        "Design a distributed Cloud Spanner failover consensus protocol",
+    ]
+    assert calls[1]["hook_out"] == {}
+
+    # Telemetry records exactly 2 `cli_chat` SWITCH events (0 duplicate hook scorings)
+    telemetry_rows = [
+        json.loads(line)
+        for line in (state_dir / "telemetry.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert len(telemetry_rows) == 2
+    assert telemetry_rows[0]["mode"] == "cli_chat"
+    assert telemetry_rows[0]["did_auto_switch"] is True
+    assert telemetry_rows[0]["subagent_tier"] == "flash_lite"
+    assert telemetry_rows[0]["recommended_model_id"] == "gemini-5.0-flash-low"
+    assert telemetry_rows[1]["mode"] == "cli_chat"
+    assert telemetry_rows[1]["did_auto_switch"] is True
+    assert telemetry_rows[1]["subagent_tier"] == "pro"
+    assert telemetry_rows[1]["recommended_model_id"] == "gemini-5.0-pro-high"
+    assert "gemini-5.0-flash-low" in chat_proc.stderr
+    assert "gemini-5.0-pro-high" in chat_proc.stderr
+  finally:
+    server.shutdown()
+    server.server_close()
