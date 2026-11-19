@@ -1,10 +1,12 @@
-# Gemini API Key Quickstart & Router Operations Guide
+# 5-Minute `GEMINI_API_KEY` Quickstart
 
-This guide walks through installing **Gemini Decisions Router**, configuring `0600` private credentials so both the **Antigravity Desktop App** and **`agy` CLI** authenticate reliably, viewing live routing banners and telemetry, and operating all CLI and MCP tools.
+Get `agyr` and the companion **Gemini Decisions Router** plugin running in under 5 minutes using a Google AI Studio `GEMINI_API_KEY`.
 
-## 1. Frictionless Installation (`./install.sh`)
+> **Using Google Cloud instead of an API key?** See [AUTHENTICATION_ADC.md](AUTHENTICATION_ADC.md) for keyless OAuth2 Application Default Credentials (`gemini_adc` and `vertex_adc`).
 
-Clone the repository and run `./install.sh` (requires Python 3.11+):
+## Step 1: Install `agyr` and the Companion Plugin (`./install.sh`)
+
+Clone the repository and run `./install.sh` (requires Python 3.11+, zero `pip` packages):
 
 ```bash
 git clone https://github.com/YOUR_ORG/gemini-decisions-router.git
@@ -13,45 +15,33 @@ chmod +x install.sh
 ./install.sh
 ```
 
-What `./install.sh` sets up automatically:
-- Copies `plugin.json`, `mcp_config.json`, `hooks.json`, `decisions_engine.py`, `mcp_server.py`, `router_hook.py`, `assets/logo.svg`, and `skills/gemini-decisions-router/SKILL.md` into `~/.gemini/config/plugins/gemini-decisions-router` (override with `ANTIGRAVITY_PLUGINS_DIR`).
-- Installs the `~/.local/bin/agy-router` CLI command (override with `BIN_DIR`). Make sure `~/.local/bin` is on your `PATH` (or invoke `~/.local/bin/agy-router` directly).
-- Validates the installed plugin package using `agy plugin validate ~/.gemini/config/plugins/gemini-decisions-router --strict` whenever `agy` is available on `PATH`.
+`./install.sh` sets up everything in one pass:
+- Installs `~/.local/bin/agyr` (routed `agy` launcher) and `~/.local/bin/agy-router` (router CLI and multi-turn REPL). Make sure `~/.local/bin` is on your `PATH`.
+- Installs the companion Antigravity plugin (`plugin.json`, `hooks.json`, `mcp_config.json`, `agents/intent-router.md`, `rules/AGENTS.md`, and `skills/gemini-decisions-router/SKILL.md`) into `~/.gemini/config/plugins/gemini-decisions-router`.
+- Runs `agy plugin validate ~/.gemini/config/plugins/gemini-decisions-router --strict` when `agy` is installed.
 
-Reload Antigravity after installation so it loads the plugin manifest, MCP server, hooks, and skill.
+Reload the Antigravity Desktop App if it is currently open so it picks up the hooks and MCP server.
 
-## 2. Configure Credentials for Desktop App & `agy` CLI (`auth-setup`)
+## Step 2: Save Your `GEMINI_API_KEY` (`auth-setup`)
 
-When you launch the Antigravity Desktop App from a macOS Dock icon or Linux desktop launcher, GUI child processes often do **not** inherit variables exported in `~/.bashrc` or `~/.zshrc`.
-
-To make `GEMINI_API_KEY` (or `GOOGLE_CLOUD_PROJECT` for ADC) work identically across **both** the GUI-launched Antigravity Desktop App and `agy` CLI without shell inheritance pitfalls, run `agy-router auth-setup`:
+Desktop GUI launchers on macOS and Linux often start the Antigravity Desktop App without sourcing `~/.bashrc` or `~/.zshrc`. Running `agy-router auth-setup` writes a `0600`-permissioned `~/.config/gemini-decisions-router/.env` file (`0700` parent directory, symlinks and group/world-readable files rejected) so both **`agyr` / `agy` CLI** and the **Antigravity Desktop App** authenticate reliably:
 
 ```bash
-# Option A: Save credentials from your current shell environment
+# Option A: Import GEMINI_API_KEY from your current shell
 export GEMINI_API_KEY="your-ai-studio-api-key"
-agy-router auth-setup --from-env
+agy-router auth-setup --from-env --auth-mode auto
 
-# Option B: Pipe GEMINI_API_KEY on stdin (avoids recording the key in shell history)
-printf '%s\n' 'your-ai-studio-api-key' | agy-router auth-setup --api-key-stdin
-
-# Option C: Configure keyless ADC project and auth mode instead of an API key
-agy-router auth-setup --project your-gcp-project-id --auth-mode gemini_adc
+# Option B: Pipe via stdin so the key never touches shell history
+printf '%s\n' 'your-ai-studio-api-key' | agy-router auth-setup --api-key-stdin --auth-mode auto
 ```
 
-How the private `.env` credential loader protects your secrets:
-- `auth-setup` creates `~/.config/gemini-decisions-router` with `0700` permissions and writes `~/.config/gemini-decisions-router/.env` with `0600` (`chmod 600`, owner read/write only), printing a redacted JSON confirmation that never echoes secret values.
-- At runtime, `decisions_engine.load_private_dotenv` inspects the file with `os.lstat` and refuses to load `.env` if it is a symlink or if group/world permission bits are set (`(st_mode & 0o077) != 0`).
-- Process environment variables (`os.environ`) always take precedence over `~/.config/gemini-decisions-router/.env`.
-- Never place `GEMINI_API_KEY` or OAuth tokens inside `config.json` or `router_config.json`; the plugin rejects JSON configs containing embedded secrets.
-
-Verify your credential resolution and run a live 1-question `noul` probe against `gemini-decision-1`:
+Verify credential resolution and run a live 1-question prefill probe (`0` output tokens) against `gemini-decision-1`:
 
 ```bash
-agy-router status
 agy-router auth-check --live
 ```
 
-Expected output from `agy-router auth-check --live`:
+Expected output (`ok: true` in `~200-250 ms`):
 
 ```json
 {
@@ -75,110 +65,61 @@ Expected output from `agy-router auth-check --live`:
 }
 ```
 
-## 3. How to See Which Route Was Taken (App & CLI)
+> **Security note:** Process environment variables always override `.env` entries. Never place `GEMINI_API_KEY` inside `config.json` or `router_config.json`; `decisions_engine.py` rejects JSON files containing embedded secrets.
 
-### A. Inline `"✦ Routed with Intent"` Banners (Desktop App & `agy` CLI)
+## Step 3: Use `agyr` Instead of `agy`
 
-Every explicit user prompt triggers `PreInvocation`:
-1. **Tier 0 (`<1 ms`):** Local fast rules classify confirmations (`"yes"`, `"ship it"`), explicit model requests (`"use gemini pro"`), crash markers, and smart Turn 2+ asymmetric thread floors (preserving `pro` and `coding_edit` floors on continuations while never locking `flash` on standalone `quick_lookup` questions).
-2. **Tier 1 (`~180-350 ms`, 0 output tokens, `1.5s` hook deadline):** Sends a single `CreateDecision` call to `gemini-decision-1` scoring `task_class` (`choice`), `needs_pro_reasoning` (`noul`), and `effort_rubric` (`score`).
-
-Visibility works automatically across both surfaces:
-- **Antigravity Desktop App (0 Model Tokens):** Renders a collapsible `"✦ Routed with Intent"` UI card via `renderInfo` with `"systemMessage": ""` (0 prompt tokens; `metadata` map fields are intentionally omitted for protobuf scrubber safety).
-- **`agy` CLI (`cli_inline_banner: true` by default):** Because `agy` CLI suppresses empty-message UI steps, `router_hook.py` automatically detects `agy` CLI (`/.gemini/antigravity-cli/` or `agy` parent process) and, when `verbosity != "silent"`, injects a concise 1-line badge instruction on Step 1 so the assistant begins its reply with `> ✦ **Routed with Intent** -> \`<model>\` [<thinking>] · <conf>% · <ms> ms`. Toggle anytime via `"cli_inline_banner": false` in `router_config.json`, `agy-router set-mode advisor --no-cli-inline-banner`, or `GEMINI_DECISIONS_CLI_INLINE_BANNER=0`.
-
-When an agent spawns a helper via `invoke_subagent` with `Model` unset or `"inherit"`, the `PreToolUse` hook right-sizes `Model` to `flash_lite`, `flash`, or `pro` and displays an inline tool notice:
-`✦ Routed with Intent -> subagent Model=flash_lite (95% | 180 ms)` (omitted when verbosity is `silent`).
-
-### B. All 4 Verbosity Presets (`silent`, `compact`, `normal`, `verbose`)
-
-Choose how much detail appears inline:
-- **`silent`:** Emits no inline `PreInvocation` banner (`{}`) and omits the `PreToolUse` `reason` string, while still recording every event to `~/.cache/gemini-decisions-router/telemetry.jsonl`.
-- **`compact`:** Single-line inline badge:
-  `✦ **Routed with Intent** (Recommended) -> gemini-3.1-pro-high [Max] · 91% · gemini_api (240 ms)`
-- **`normal` *(Default)*:** Renders the `ROUTED WITH INTENT` box banner plus Active Dropdown Model, Calibrated Route, Task Class, Decision Gate latency, and Rationale.
-- **`verbose`:** Everything in `normal` plus calibrated Class Probabilities, `P(pro reasoning)`, `Effort Rubric`, `Thread Lock`, and explicit override flags.
-
-Configure verbosity in any of three ways:
+`agyr` scores your prompt via `gemini-decision-1` before starting `agy`, selects the best installed CLI `--model` and sibling `--effort` (`low`, `medium`, `high`, `max`), and passes `GEMINI_DECISIONS_PRE_ROUTED` so Turn 1 never scores twice:
 
 ```bash
-# 1. Persistent CLI command
-agy-router set-verbosity compact
-agy-router set-verbosity normal
-agy-router set-verbosity verbose
-agy-router set-verbosity silent
+# 1. Interactive TUI (-i): launches agy on calibrated --model and --effort
+agyr "Refactor this FastAPI endpoint to validate pagination parameters and add unit tests"
 
-# 2. Environment variable override
-export GEMINI_DECISIONS_VERBOSITY="compact"
+# 2. One-shot print mode (-p): routes quick lookups to flash_lite and hard bugs to pro
+agyr -p "What HTTP status code means Too Many Requests?"
+agyr -p "Design a lock-free ring buffer memory ordering proof in C++20"
+
+# 3. Bare TUI (no prompt): launches agy --agent intent-router on flash_lite (--effort low)
+#    Answers quick lookups in-turn and right-sizes delegated subagents via PreToolUse
+agyr
+
+# 4. Multi-turn model-hopping REPL: re-scores each turn on the same --conversation
+#    (/new resets the thread, /exit quits, --conversation <id> resumes an existing chat)
+agy-router chat
 ```
 
-Or ask the agent in chat to call the **`configure_router`** MCP tool (`{"verbosity": "compact"}`).
-
-### C. Live Terminal Monitoring (`watch`) & Historical Summaries (`stats`)
-
-Monitor routing in real time from any terminal window or inspect historical summaries:
+Inspect a routing plan without launching `agy` or pass an explicit `--model` straight through untouched:
 
 ```bash
-# Live streaming monitor ("✦ ROUTED WITH INTENT | LIVE MONITOR")
+agyr --dry-run -p "What HTTP status code means Too Many Requests?"
+agyr --model gemini-3-flash -p "Summarize git status"
+```
+
+## Step 4: Watch Live Telemetry & Sync Models (`watch` & `sync-models`)
+
+Open a side terminal while working in `agyr` or the Antigravity Desktop App to watch live routing events, view summary statistics, or sync newly released models:
+
+```bash
+# Stream live SWITCH, ADVISE, and PreToolUse subagent events
 agy-router watch
-agy-router watch --verbosity verbose --interval 0.5
-agy-router watch --once
 
-# Historical telemetry summaries
+# Summarize historical tier distribution, average latency, and recent prompts
 agy-router stats
-agy-router stats --verbosity compact
-agy-router stats --verbosity verbose --limit 50
-agy-router stats --json
-```
 
-Test prompts directly from the CLI at any time:
+# Auto-discover installed Antigravity / agy models and apply recommended tier mappings
+agy-router sync-models --apply-recommended
+agy-router list-models --refresh
 
-```bash
-# Simple lookup -> flash_lite
-agy-router route --prompt "What is the capital of France?" --no-fast-rules --pretty
-
-# Medium code edit -> flash
-agy-router route \
-  --prompt "Refactor this FastAPI endpoint to validate pagination parameters and add unit tests" \
-  --no-fast-rules \
-  --pretty
-
-# Deep architecture -> pro
-agy-router route \
-  --prompt "Design a multi-region Cloud Spanner schema with conflict-free failover and zero-downtime migration" \
-  --no-fast-rules \
-  --pretty
-```
-
-## 4. `advisor` Mode vs Hardened `auto_switch`
-
-- **`advisor` *(Default)*:** Recommends the calibrated model and thinking effort via the inline `"✦ Routed with Intent"` banner and right-sizes `invoke_subagent` calls without switching your active conversation model. Per-message deduplication (`seen_turn_<conv>.json`) ensures Steps 2..N of multi-step tool loops return `{}` in `<1 ms` with zero extra API calls or duplicate banners.
-- **`auto_switch`:** Switches the active Antigravity Desktop App conversation model when confidence meets `min_confidence` (default `0.45`):
-  - **Safe in `agy` CLI (`GetCascadeTrajectory` Pre-Flight):** `agy` CLI runs on an ephemeral Language Server port rather than a persistent desktop port. Before `auto_switch` ever returns `{"terminationBehavior": "terminate"}`, it runs `_verify_cascade_ownership` (`GetCascadeTrajectory` with a `400 ms` timeout). When the cascade is unowned (such as in `agy` CLI), `router_hook.py` automatically falls back to `advisor` mode (`"auto_switch_fallback": "cascade_unowned"` in telemetry) and renders the inline banner so CLI sessions never hang.
-  - **Multi-Step Deduplication:** Uses `reroute_<conv>.json` (`600s` TTL) so redispatched turns display their switched banner once and take `<1 ms` on subsequent tool-loop steps.
-
-```bash
+# Customize inline banner verbosity (silent | compact | normal | verbose) or Desktop App mode
+agy-router set-verbosity compact
 agy-router set-mode advisor
 agy-router set-mode auto_switch --min-confidence 0.55
-agy-router set-mode off
 ```
 
-## 5. Customizing Target Models & Using the 4 MCP Tools
+## Demo & Next Steps
 
-Inspect and customize the models mapped to `flash_lite`, `flash`, and `pro`:
+![agyr Demo](../assets/agy-router-demo.gif)
 
-```bash
-agy-router list-models
-agy-router set-models --pro claude-opus-4-6
-agy-router set-models --reset
-```
-
-Agents in Antigravity have on-demand access to four MCP tools under `decisions`:
-- **`create_decision`:** Evaluates shared text or allowlisted local files once across 1 to 64 `noul`, `choice`, and `score` questions in a single zero-output-token pass.
-- **`route_prompt`:** Returns `recommended_tier`, `recommended_model_id`, `thinking_level`, `confidence`, and calibrated probabilities for any prompt or subagent task.
-- **`list_models`:** Returns all built-in and custom target models, Antigravity model enums, default thinking levels, and active `tier_models`.
-- **`configure_router`:** Updates `mode` (`advisor`, `auto_switch`, `off`), `verbosity` (`silent`, `compact`, `normal`, `verbose`), `min_confidence`, `enable_subagent_routing`, and `tier_models` in `~/.config/gemini-decisions-router/router_config.json`.
-
-## 6. Demo
-
-![Gemini Decisions Router in action in Antigravity](../assets/agy-router-demo.gif)
+- **[ARCHITECTURE.md](ARCHITECTURE.md):** Mermaid architecture and sequence diagrams, Asymmetric Thread Floor, `GEMINI_DECISIONS_PRE_ROUTED` handoff, and MCP tool schemas (`create_decision`, `route_prompt`, `list_models`, `configure_router`).
+- **[AUTHENTICATION_ADC.md](AUTHENTICATION_ADC.md):** Keyless Google Cloud OAuth2 setup (`gemini_adc` and `vertex_adc`).
+- **[BENCHMARKS.md](BENCHMARKS.md):** Live `N=100` head-to-head latency, accuracy, and calibration benchmarks.
