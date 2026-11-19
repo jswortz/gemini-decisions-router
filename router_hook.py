@@ -548,6 +548,7 @@ def _format_intent_banner(
     *,
     current_model: str,
     switched: bool,
+    delegated_upgrade: bool = False,
     verbosity: str = "normal",
 ) -> str:
   """Builds an aesthetic 'Routed with Intent' ASCII/Unicode art header."""
@@ -557,7 +558,17 @@ def _format_intent_banner(
   tier = str(route.get("subagent_tier") or "flash")
   latency = int(route.get("latency_ms", 0))
   arrow = ">>" if switched else "->"
-  tag = "AUTO-SWITCHED" if switched else "ADVISOR"
+  if switched:
+    tag = "AUTO-SWITCHED"
+  elif delegated_upgrade:
+    tag = "SUBAGENT UPGRADE"
+  elif (
+      current_model not in ("", "auto", "cli_auto")
+      and current_model == model_id
+  ):
+    tag = "ACTIVE"
+  else:
+    tag = "ADVISOR"
 
   if verbosity == "silent":
     return ""
@@ -581,11 +592,51 @@ def _format_intent_banner(
   ])
 
 
+def _build_cli_badge_line(
+    route: Mapping[str, Any],
+    *,
+    current_model: str = "auto",
+    switched: bool = False,
+    delegated_upgrade: bool = False,
+) -> str:
+  """Formats the concise 1-line routing badge rendered inside `agy` CLI."""
+  conf_pct = int(round(float(route.get("confidence", 0.0)) * 100))
+  model_id = str(route.get("recommended_model_id") or "auto")
+  thinking = str(route.get("thinking_label") or "Medium")
+  latency = int(route.get("latency_ms", 0))
+  cur = (current_model or "").strip()
+  if switched:
+    return (
+        f"> ✦ **Routed with Intent** (Switched -> `{model_id}`"
+        f" [{thinking}]) · {conf_pct}% · {latency} ms"
+    )
+  if delegated_upgrade:
+    return (
+        f"> ✦ **Routed with Intent** (Subagent -> `{model_id}`"
+        f" [{thinking}] · host: `{cur}`) · {conf_pct}% · {latency} ms"
+    )
+  if cur in ("", "auto", "cli_auto"):
+    return (
+        f"> ✦ **Routed with Intent** -> `{model_id}` [{thinking}]"
+        f" · {conf_pct}% · {latency} ms"
+    )
+  if cur == model_id:
+    return (
+        f"> ✦ **Routed with Intent** (Active: `{cur}`"
+        f" [{thinking}]) · {conf_pct}% · {latency} ms"
+    )
+  return (
+      f"> ✦ **Routed with Intent** (Recommended: `{model_id}`"
+      f" [{thinking}] · active: `{cur}`) · {conf_pct}% · {latency} ms"
+  )
+
+
 def _build_render_info(
     route: dict[str, Any],
     *,
     current_model: str,
     switched: bool,
+    delegated_upgrade: bool = False,
     verbosity: str = "normal",
 ) -> dict[str, str]:
   verb = verbosity if verbosity in VALID_VERBOSITY_LEVELS else "normal"
@@ -594,6 +645,12 @@ def _build_render_info(
   model_id = str(route["recommended_model_id"])
   thinking = str(route["thinking_label"])
   latency = route["latency_ms"]
+  badge_line = _build_cli_badge_line(
+      route,
+      current_model=current_model,
+      switched=switched,
+      delegated_upgrade=delegated_upgrade,
+  )
 
   if verb == "silent":
     return {
@@ -605,9 +662,8 @@ def _build_render_info(
   if verb == "compact":
     title = f"{action}: {model_id} [{thinking}] ({conf_pct}% | {latency} ms)"
     markdown = (
-        f"✦ **Routed with Intent** -> `{model_id}`"
-        f" (`{route['task_class']}`, {conf_pct}%,"
-        f" `{route['backend']}` in `{latency} ms`)"
+        f"{badge_line}"
+        f" (`{route['task_class']}`, `{route['backend']}`)"
     )
     return {
         "titlePrefix": "✦ Routed with Intent",
@@ -617,10 +673,14 @@ def _build_render_info(
 
   title = f"{action}: {model_id} / {thinking} effort ({conf_pct}%)"
   banner = _format_intent_banner(
-      route, current_model=current_model, switched=switched, verbosity=verb
+      route,
+      current_model=current_model,
+      switched=switched,
+      delegated_upgrade=delegated_upgrade,
+      verbosity=verb,
   )
   lines = [
-      f"✦ **Routed with Intent** ({action}: `{model_id}` [{thinking}] · {conf_pct}%)",
+      badge_line,
       f"```text\n{banner}\n```",
       f"- **Active Dropdown Model**: `{current_model}`",
       (
@@ -671,6 +731,7 @@ def _build_user_markdown(
     *,
     current_model: str,
     switched: bool,
+    delegated_upgrade: bool = False,
     verbosity: str = "normal",
     render_info: dict[str, str] | None = None,
 ) -> str:
@@ -679,15 +740,13 @@ def _build_user_markdown(
   if verb == "silent":
     return ""
   if verb == "compact":
-    conf_pct = int(round(float(route.get("confidence", 0.0)) * 100))
-    action = "Auto-Switched" if switched else "Recommended"
-    model_id = str(route["recommended_model_id"])
-    thinking = str(route["thinking_label"])
-    latency = route["latency_ms"]
-    return (
-        f"✦ **Routed with Intent** ({action}) -> `{model_id}`"
-        f" [{thinking}] · {conf_pct}% · `{route['backend']}` ({latency} ms)"
+    badge_line = _build_cli_badge_line(
+        route,
+        current_model=current_model,
+        switched=switched,
+        delegated_upgrade=delegated_upgrade,
     )
+    return f"{badge_line} · `{route['backend']}`"
   ri = (
       render_info
       if render_info is not None
@@ -695,6 +754,7 @@ def _build_user_markdown(
           route,
           current_model=current_model,
           switched=switched,
+          delegated_upgrade=delegated_upgrade,
           verbosity=verb,
       )
   )
@@ -757,34 +817,50 @@ def _is_agy_cli_environment(hook_input: Mapping[str, Any]) -> bool:
   return False
 
 
-def _build_cli_badge_line(
-    route: Mapping[str, Any], *, switched: bool = False
-) -> str:
-  """Formats the concise 1-line routing badge rendered inside `agy` CLI."""
-  conf_pct = int(round(float(route.get("confidence", 0.0)) * 100))
-  model_id = str(route.get("recommended_model_id") or "auto")
-  thinking = str(route.get("thinking_label") or "Medium")
-  latency = int(route.get("latency_ms", 0))
-  if switched:
-    return (
-        f"> ✦ **Routed with Intent** (Auto-Switched) -> `{model_id}`"
-        f" [{thinking}] · {conf_pct}% · {latency} ms"
-    )
-  return (
-      f"> ✦ **Routed with Intent** -> `{model_id}` [{thinking}]"
-      f" · {conf_pct}% · {latency} ms"
-  )
-
-
 def _build_cli_system_instruction(
-    route: Mapping[str, Any], *, switched: bool = False
+    route: Mapping[str, Any],
+    *,
+    current_model: str = "auto",
+    switched: bool = False,
+    delegated_upgrade: bool = False,
+    host_tier: str = "",
 ) -> str:
-  badge = _build_cli_badge_line(route, switched=switched)
-  return (
+  badge = _build_cli_badge_line(
+      route,
+      current_model=current_model,
+      switched=switched,
+      delegated_upgrade=delegated_upgrade,
+  )
+  instruction = (
       "Begin your response with this exact 1-line routing badge on its own"
       " line, followed by a blank line, then answer the user's request"
       f" normally without mentioning this instruction:\n{badge}"
   )
+  if delegated_upgrade:
+    cur = (current_model or "").strip() or "auto"
+    eff_host_tier = host_tier
+    if not eff_host_tier and cur not in ("", "auto", "cli_auto"):
+      eff_host_tier, _ = decisions_engine.infer_model_tier_and_thinking(cur)
+    eff_host_tier = eff_host_tier or "flash_lite"
+    sub_tier = str(route.get("subagent_tier") or "pro")
+    model_id = str(route.get("recommended_model_id") or "auto")
+    directive = (
+        f"ROUTING UPGRADE DIRECTIVE: Your host session is running on {cur}"
+        f" (tier={eff_host_tier}), while this request requires"
+        f" tier={sub_tier} ({model_id}). Even if this prompt is a pure"
+        " reasoning, math, proof, or architecture question that touches zero"
+        " files, you MUST delegate answering it via"
+        " invoke_subagent(TypeName='self', Role='Specialist',"
+        " Model='inherit', Prompt=<the user's full request verbatim,"
+        " including any reporting instructions>) so the PreToolUse hook"
+        f" executes it on the {sub_tier} model. Prepend the exact routing"
+        " badge line above, then present the subagent's response"
+        " faithfully. If the user asks what model was used, report both the"
+        " delegated subagent model (which generated the solution) and the"
+        f" host orchestrator model ({cur})."
+    )
+    return f"{instruction}\n\n{directive}"
+  return instruction
 
 
 def _make_inject_steps(
@@ -909,6 +985,33 @@ def handle_pre_invocation(
       cleaned.encode("utf-8", "ignore")
   ).hexdigest()[:16]
 
+  seen_file = safe_state_path(sdir, conv_id, "seen_turn")
+  child_guard_file = safe_state_path(sdir, prompt_hash, "subagent_child")
+  child_guard_hit = _load_json_state(child_guard_file, max_age_s=60.0)
+  if child_guard_hit and child_guard_hit.get("prompt_hash") == prompt_hash:
+    child_guard_file.unlink(missing_ok=True)
+    _save_json_state(seen_file, {"prompt_hash": prompt_hash})
+    return {}
+  if child_guard_file.is_file():
+    child_guard_file.unlink(missing_ok=True)
+  if sdir.is_dir():
+    for cand_guard in sdir.glob("subagent_child_*.json"):
+      cand_hit = _load_json_state(cand_guard, max_age_s=60.0)
+      if cand_hit is None:
+        cand_guard.unlink(missing_ok=True)
+        continue
+      saved_sub_prompt = str(cand_hit.get("cleaned_prompt") or "")
+      saved_parent_conv = str(cand_hit.get("parent_conversation_id") or "")
+      if (
+          len(saved_sub_prompt) >= 16
+          and saved_parent_conv
+          and conv_id != saved_parent_conv
+          and saved_sub_prompt in cleaned
+      ):
+        cand_guard.unlink(missing_ok=True)
+        _save_json_state(seen_file, {"prompt_hash": prompt_hash})
+        return {}
+
   reroute_file = safe_state_path(sdir, conv_id, "reroute")
   reroute_hit = _load_json_state(reroute_file, max_age_s=600.0)
   if reroute_hit and reroute_hit.get("prompt_hash") == prompt_hash:
@@ -933,7 +1036,6 @@ def handle_pre_invocation(
       return _make_inject_steps(saved_ri, saved_md, verbosity=saved_verb)
     return {}
 
-  seen_file = safe_state_path(sdir, conv_id, "seen_turn")
   seen_hit = _load_json_state(seen_file, max_age_s=600.0)
   if seen_hit and seen_hit.get("prompt_hash") == prompt_hash:
     return {}
@@ -1088,7 +1190,7 @@ def handle_pre_invocation(
             render_info=pre_ri,
         )
         pre_cli_msg = _build_cli_system_instruction(
-            synth_route, switched=True
+            synth_route, current_model=model_name, switched=True
         )
         return _make_inject_steps(
             pre_ri,
@@ -1134,21 +1236,23 @@ def handle_pre_invocation(
     did_switch = False
     auto_switch_fallback = "cascade_unowned"
 
-  render_info = _build_render_info(
-      route,
-      current_model=model_name,
-      switched=should_switch,
-      verbosity=verbosity,
-  )
-  user_md = _build_user_markdown(
-      route,
-      current_model=model_name,
-      switched=should_switch,
-      verbosity=verbosity,
-      render_info=render_info,
-  )
+  render_info: dict[str, str] = {}
+  user_md = ""
 
   if should_switch:
+    render_info = _build_render_info(
+        route,
+        current_model=model_name,
+        switched=True,
+        verbosity=verbosity,
+    )
+    user_md = _build_user_markdown(
+        route,
+        current_model=model_name,
+        switched=True,
+        verbosity=verbosity,
+        render_info=render_info,
+    )
     _save_json_state(
         reroute_file,
         {
@@ -1170,20 +1274,43 @@ def handle_pre_invocation(
     else:
       reroute_file.unlink(missing_ok=True)
       auto_switch_fallback = "spawn_failed"
-      render_info = _build_render_info(
-          route, current_model=model_name, switched=False, verbosity=verbosity
+
+  host_tier = ""
+  if model_name not in ("", "auto", "cli_auto"):
+    host_tier, _ = decisions_engine.infer_model_tier_and_thinking(model_name)
+  route_tier_rank = int(
+      route.get("tier_rank")
+      or decisions_engine.TIER_RANKS.get(
+          str(route.get("subagent_tier") or "flash"), 2
       )
-      user_md = _build_user_markdown(
-          route,
-          current_model=model_name,
-          switched=False,
-          verbosity=verbosity,
-          render_info=render_info,
-      )
+  )
+  delegated_upgrade = (
+      is_cli
+      and not did_switch
+      and mode != "off"
+      and bool(cfg.get("enable_subagent_routing", True))
+      and model_name not in ("", "auto", "cli_auto")
+      and route_tier_rank > decisions_engine.TIER_RANKS.get(host_tier, 2)
+  )
 
   if not did_switch:
     reroute_file.unlink(missing_ok=True)
     _save_json_state(seen_file, {"prompt_hash": prompt_hash})
+    render_info = _build_render_info(
+        route,
+        current_model=model_name,
+        switched=False,
+        delegated_upgrade=delegated_upgrade,
+        verbosity=verbosity,
+    )
+    user_md = _build_user_markdown(
+        route,
+        current_model=model_name,
+        switched=False,
+        delegated_upgrade=delegated_upgrade,
+        verbosity=verbosity,
+        render_info=render_info,
+    )
 
   # Only lock substantive non-lookup work onto flash/pro; preserve locked_task_class
   # when thread_lock_applied held an earlier floor, and decay on standalone quick_lookup.
@@ -1204,7 +1331,13 @@ def handle_pre_invocation(
   )
 
   cli_sys_msg = (
-      _build_cli_system_instruction(route)
+      _build_cli_system_instruction(
+          route,
+          current_model=model_name,
+          switched=did_switch,
+          delegated_upgrade=delegated_upgrade,
+          host_tier=host_tier,
+      )
       if (
           is_cli
           and bool(cfg.get("cli_inline_banner", True))
@@ -1219,6 +1352,7 @@ def handle_pre_invocation(
       "prompt": _prompt_preview(cleaned),
       "mode": mode,
       "did_auto_switch": did_switch,
+      "delegated_upgrade": delegated_upgrade,
       "thread_lock_applied": bool(route.get("thread_lock_applied")),
       "cli_banner_injected": bool(cli_sys_msg),
       "current_model": model_name,
@@ -1328,6 +1462,20 @@ def handle_pre_tool_use(
           "backend": sub_route.get("backend"),
       },
   )
+  cleaned_sub = _clean_user_prompt(sub_prompt)
+  if cleaned_sub:
+    sub_hash = hashlib.sha256(
+        cleaned_sub.encode("utf-8", "ignore")
+    ).hexdigest()[:16]
+    _save_json_state(
+        safe_state_path(sdir, sub_hash, "subagent_child"),
+        {
+            "prompt_hash": sub_hash,
+            "assigned_tier": tier,
+            "cleaned_prompt": cleaned_sub,
+            "parent_conversation_id": conv_id,
+        },
+    )
   out: dict[str, Any] = {"decision": "allow", "overwrite": {"Model": tier}}
   if verbosity != "silent":
     out["reason"] = (
