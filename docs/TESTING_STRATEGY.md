@@ -22,7 +22,7 @@ agy-router sync-models --apply-recommended
 
 ### Dynamic Runtime Model Auto-Discovery
 
-Whenever new models are released in Antigravity or `agy` CLI (for example `gemini-3.8-flash-medium`, `gemini-next-pro-high`, or `gemini-pro-orchestrator`), the router automatically discovers them without requiring code changes:
+Whenever new models are released in Antigravity or `agy` CLI (for example `gemini-next-flash-medium`, `gemini-next-pro-high`, or `gemini-pro-orchestrator`), the router automatically discovers them without requiring code changes:
 
 - **Dual Discovery Sources:** Queries `POST /exa.language_server_pb.LanguageServerService/GetAvailableModels` on the local Antigravity Language Server (capturing live Antigravity model enums so `auto_switch` works out of the box) and merges model IDs and display labels from `agy models`.
 - **Automatic Tier & Thinking Inference:** Classifies discovered models into `flash_lite`, `flash`, or `pro` with calibrated default thinking levels (`1..4`) and computes `suggested_tier_models`.
@@ -85,11 +85,14 @@ GUI-launched Antigravity Desktop App sessions rely on `~/.config/gemini-decision
 - **Symlink Rejection:** Confirms `os.lstat` detects symlinked `.env` targets (`stat.S_ISLNK`) and raises `decisions_engine.ConfigError` before opening the file.
 - **Redacted `auth-setup` CLI:** Verifies `agy-router auth-setup` creates a `0700` parent directory and `0600` `.env` file without printing secret values to `stdout` or `stderr`.
 
-### B. Universal `metadata.user_markdown` Banners & 4-Level Verbosity (`test_user_markdown_inline_banners_and_four_verbosity_levels`)
+### B. Panic-Safe Desktop `renderInfo`, `agy` CLI Inline Badge, & 4-Level Verbosity (`test_user_markdown_inline_banners_and_four_verbosity_levels`, `test_agy_cli_inline_banner_detection_and_toggle`)
 
-Because `renderInfo` only renders on certain builds whereas `systemMessage.metadata.user_markdown` renders inline in **both** the Antigravity Desktop App and `agy` CLI, tests exercise all four verbosity levels (`silent`, `compact`, `normal`, `verbose`):
+Tests exercise all four verbosity levels (`silent`, `compact`, `normal`, `verbose`) across both Antigravity Desktop App and `agy` CLI:
+- **Protobuf Map-Scrubber Safety:** Verifies `"metadata"` is never populated on `injectSteps[0]["systemMessage"]` (avoiding the host protobuf map scrubber panic on string map values).
 - **`silent`:** Verifies `handle_pre_invocation` returns `{}` (zero injected UI steps) while still appending the full routing record to `telemetry.jsonl`, and verifies `handle_pre_tool_use` (`invoke_subagent`) omits `reason` while still applying `"overwrite": {"Model": "<tier>"}`.
-- **`compact`, `normal`, and `verbose`:** Verifies `injectSteps[0]["systemMessage"]["systemMessage"] == ""` (guaranteeing **0 model context tokens** consumed) and confirms `injectSteps[0]["systemMessage"]["metadata"]["user_markdown"]` contains `"Routed with Intent"` at the requested detail level (single-line summary for `compact`, `ROUTED WITH INTENT` box + rationale for `normal`, and class probabilities + `P(pro reasoning)` + `Effort Rubric` + `Thread Lock` for `verbose`).
+- **Desktop App (`compact`, `normal`, `verbose`):** Verifies `injectSteps[0]["systemMessage"]["systemMessage"] == ""` (**0 model context tokens**) and confirms `injectSteps[0]["systemMessage"]["renderInfo"]["markdown"]` contains `"Routed with Intent"` at the requested detail level.
+- **`agy` CLI Inline Badge & Toggle:** Verifies `_is_agy_cli_environment` detects `agy` CLI sessions (`/.gemini/antigravity-cli/`) and injects the 1-line routing badge (`> ✦ **Routed with Intent** -> \`<model>\` [<thinking>] · <conf>% · <ms> ms`) on Step 1 when `cli_inline_banner=True`, deduplicates Steps 2..N (`{}`), and suppresses prompt tokens when `cli_inline_banner=False`.
+- **Smart Thread Floor & Telemetry Labels (`test_smart_thread_floor_quick_lookup_unlock_and_config`, `test_watch_and_stats_action_and_reason_labels`):** Verifies `quick_lookup` turns never lock a `flash` floor, standalone high-confidence (`>0.85`) questions unlock prior floors while continuations (`"yes go ahead"`, `"do step 2 next"`) preserve `pro`/`coding_edit` floors, `enable_thread_floor=False` disables floors cleanly, and `watch`/`stats` distinguish `ADVISE`, `CLI-ADVISE`, and `SWITCH` alongside `reason=gemini_api` vs `reason=thread_lock`.
 - **Subagent Right-Sizing Notice:** Confirms `PreToolUse` (`invoke_subagent`) includes `"Routed with Intent"` in `reason` whenever `verbosity != "silent"`.
 
 ### C. Multi-Step `PreInvocation` Deduplication (`<1 ms` on Steps 2..N)

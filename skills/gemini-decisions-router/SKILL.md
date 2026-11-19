@@ -20,13 +20,15 @@ This plugin connects the Antigravity Desktop App and `agy` CLI to the Gemini Dec
    - `verbosity`: `"silent"` | `"compact"` | `"normal"` | `"verbose"`
    - `min_confidence`: number in `[0.0, 1.0]`
    - `enable_subagent_routing`: boolean
+   - `enable_thread_floor`: boolean (asymmetric Turn 2+ floor for `coding_edit` / `pro` threads; default `true`)
+   - `cli_inline_banner`: boolean (1-line `"✦ Routed with Intent"` badge inside `agy` CLI replies when `verbosity != "silent"`; default `true`)
    - `tier_models`: optional object mapping `flash_lite`, `flash`, and/or `pro` to target model IDs
 
 ## Lifecycle Hooks & Runtime Behavior
 
 - `PreInvocation`:
-  - Scores Step 1 of each explicit user turn (`1.5s` default hook HTTP deadline via `GEMINI_DECISIONS_HOOK_TIMEOUT_S`), enforces Turn 2+ asymmetric thread floors so short follow-ups (`"yes"`, `"ship it"`) never downgrade an active `pro` thread, and deduplicates multi-step tool loops (`<1 ms` on Steps 2..N).
-  - Emits zero-token inline `"✦ Routed with Intent"` banners via `systemMessage.metadata.user_markdown` (`"systemMessage": ""`) across both the Antigravity Desktop App and `agy` CLI according to `verbosity` (`silent`, `compact`, `normal`, `verbose`).
+  - Scores Step 1 of each explicit user turn (`1.5s` default hook HTTP deadline via `GEMINI_DECISIONS_HOOK_TIMEOUT_S`), enforces smart Turn 2+ asymmetric thread floors on `coding_edit`/`pro` threads while letting standalone high-confidence (`>0.85`) `quick_lookup` questions route to `flash_lite`, and deduplicates multi-step tool loops (`<1 ms` on Steps 2..N).
+  - Emits zero-token inline `"✦ Routed with Intent"` cards via `renderInfo` (`"systemMessage": ""`) in the Antigravity Desktop App, and a toggleable 1-line inline routing badge (`cli_inline_banner`) in `agy` CLI according to `verbosity` (`silent`, `compact`, `normal`, `verbose`).
   - In `auto_switch` mode, merges built-in, cached auto-discovered, and custom Antigravity model enums and runs a `GetCascadeTrajectory` ownership pre-flight check before terminating a turn; if the Language Server does not own the cascade (such as in `agy` CLI), it automatically falls back to `advisor` mode so turns never hang.
 - `PreToolUse` (`invoke_subagent`): When `Model` is unset or `"inherit"`, assigns `flash_lite`, `flash`, or `pro` and includes a `"✦ Routed with Intent"` tool `reason` notice (omitted when `verbosity` is `"silent"`).
 
@@ -74,7 +76,7 @@ agy-router sync-models --apply-recommended
 # List or customize target models mapped to flash_lite, flash, and pro
 agy-router list-models
 agy-router list-models --refresh
-agy-router set-models --flash-lite gemini-3.1-flash-lite --flash gemini-3.8-flash-medium --pro gemini-next-pro-high
+agy-router set-models --flash-lite gemini-3.1-flash-lite --flash gemini-next-flash-medium --pro gemini-next-pro-high
 agy-router set-models --reset
 ```
 

@@ -68,7 +68,9 @@ DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "min_confidence": 0.45,
     "hook_timeout_s": 1.5,
     "enable_fast_rules": True,
+    "enable_thread_floor": True,
     "enable_subagent_routing": True,
+    "cli_inline_banner": True,
     "tier_models": dict(decisions_engine.DEFAULT_TIER_MODELS),
     "custom_model_enums": {},
 }
@@ -215,6 +217,15 @@ def load_router_config(
       cfg["hook_timeout_s"] = max(0.3, min(8.0, float(env_timeout)))
     except ValueError:
       pass
+  for env_key, cfg_key in (
+      ("GEMINI_DECISIONS_ENABLE_THREAD_FLOOR", "enable_thread_floor"),
+      ("GEMINI_DECISIONS_CLI_INLINE_BANNER", "cli_inline_banner"),
+  ):
+    raw_b = os.environ.get(env_key, "").strip().lower()
+    if raw_b in ("1", "true", "yes", "on"):
+      cfg[cfg_key] = True
+    elif raw_b in ("0", "false", "no", "off"):
+      cfg[cfg_key] = False
   return cfg
 
 
@@ -330,7 +341,10 @@ def _log_redispatch_error(message: str) -> None:
 
 def _discover_ls_endpoint() -> tuple[str, str]:
   addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip()
-  csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "").strip()
+  csrf = (
+      os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "").strip()
+      or os.environ.get("ANTIGRAVITY_SERVER_CSRF_TOKEN", "").strip()
+  )
   if addr and csrf:
     return addr, csrf
   for port in (5387,):
@@ -600,20 +614,104 @@ def _build_user_markdown(
   return ri.get("markdown", "")
 
 
+def _is_agy_cli_environment(hook_input: Mapping[str, Any]) -> bool:
+  """Detects standalone `agy` CLI execution vs Antigravity Desktop App."""
+  env_override = os.environ.get("GEMINI_DECISIONS_CLI_MODE", "").strip().lower()
+  if env_override in ("1", "true", "yes", "on"):
+    return True
+  if env_override in ("0", "false", "no", "off"):
+    return False
+
+  for path_key in ("transcriptPath", "artifactDirectoryPath"):
+    raw_p = str(hook_input.get(path_key) or "").replace("\\", "/")
+    if "/antigravity-cli/" in raw_p:
+      return True
+
+  if os.environ.get("ANTIGRAVITY_VSCODE_HOST", "").strip().lower() in (
+      "1",
+      "true",
+      "yes",
+  ):
+    return False
+
+  pid = os.getppid()
+  for _ in range(2):
+    if pid <= 1:
+      break
+    proc_dir = pathlib.Path(f"/proc/{pid}")
+    try:
+      raw_cmd = (proc_dir / "cmdline").read_bytes()
+    except OSError:
+      break
+    tokens = [
+        t.decode("utf-8", "replace").strip()
+        for t in raw_cmd.split(b"\x00")
+        if t.strip()
+    ]
+    if tokens:
+      exe_name = os.path.basename(tokens[0]).lower()
+      if exe_name == "agy" and not any(
+          t == "--hub" or t.startswith("--hub-port") for t in tokens[1:]
+      ):
+        return True
+    try:
+      status_txt = (proc_dir / "status").read_text(encoding="utf-8")
+    except OSError:
+      break
+    next_pid = 0
+    for line in status_txt.splitlines():
+      if line.startswith("PPid:"):
+        try:
+          next_pid = int(line.split(":", 1)[1].strip())
+        except ValueError:
+          next_pid = 0
+        break
+    pid = next_pid
+  return False
+
+
+def _build_cli_badge_line(route: Mapping[str, Any]) -> str:
+  """Formats the concise 1-line routing badge rendered inside `agy` CLI."""
+  conf_pct = int(round(float(route.get("confidence", 0.0)) * 100))
+  model_id = str(route.get("recommended_model_id") or "auto")
+  thinking = str(route.get("thinking_label") or "Medium")
+  latency = int(route.get("latency_ms", 0))
+  return (
+      f"> ✦ **Routed with Intent** -> `{model_id}` [{thinking}]"
+      f" · {conf_pct}% · {latency} ms"
+  )
+
+
+def _build_cli_system_instruction(route: Mapping[str, Any]) -> str:
+  badge = _build_cli_badge_line(route)
+  return (
+      "Begin your response with this exact 1-line routing badge on its own"
+      " line, followed by a blank line, then answer the user's request"
+      f" normally without mentioning this instruction:\n{badge}"
+  )
+
+
 def _make_inject_steps(
     render_info: dict[str, str],
-    user_md: str,
+    user_md: str = "",
     *,
     verbosity: str = "normal",
+    cli_system_message: str = "",
 ) -> dict[str, Any]:
-  """Constructs zero-model-token injectSteps payload across App and agy CLI."""
-  if verbosity == "silent" or not user_md:
+  """Constructs panic-safe injectSteps payload across Desktop App and agy CLI.
+
+  Note: `HookSystemMessage.metadata` (`map<string, string>`) is intentionally
+  omitted because Antigravity's protobuf message scrubber panics on string map
+  values (`cannot convert string to message`), which would drop the hook output.
+  """
+  if verbosity == "silent":
+    return {}
+  if not (user_md or render_info.get("markdown") or cli_system_message):
     return {}
   return {
       "injectSteps": [{
           "systemMessage": {
-              "systemMessage": "",
-              "metadata": {"user_markdown": user_md},
+              "systemMessage": cli_system_message,
               "renderInfo": render_info,
           }
       }]
@@ -627,14 +725,18 @@ def _call_route_fn(
     cfg: dict[str, Any],
     **kwargs: Any,
 ) -> dict[str, Any]:
-  """Calls `route_fn`, passing `hook_timeout_s` when calling engine directly."""
+  """Calls `route_fn`, passing `hook_timeout_s` and `enable_thread_floor`."""
   call_kwargs = dict(kwargs)
   if route_fn is decisions_engine.route_prompt:
     call_kwargs.setdefault("tier_models", cfg.get("tier_models"))
+    call_kwargs.setdefault(
+        "enable_thread_floor", bool(cfg.get("enable_thread_floor", True))
+    )
     hook_timeout = float(cfg.get("hook_timeout_s", 1.5))
     try:
       return route_fn(prompt, hook_timeout_s=hook_timeout, **call_kwargs)
     except TypeError:
+      call_kwargs.pop("enable_thread_floor", None)
       return route_fn(prompt, **call_kwargs)
   return route_fn(prompt, **call_kwargs)
 
@@ -668,6 +770,7 @@ def handle_pre_invocation(
   raw_inv = hook_input.get("invocationNum")
   turn_num = max(1, int(raw_inv)) if isinstance(raw_inv, int) else 1
   verbosity = str(cfg.get("verbosity") or "normal")
+  is_cli = _is_agy_cli_environment(hook_input)
 
   prompt_hash = hashlib.sha256(
       cleaned.encode("utf-8", "ignore")
@@ -723,6 +826,7 @@ def handle_pre_invocation(
   target_enum = enums_map.get(target_id, "")
   should_switch = (
       mode == "auto_switch"
+      and not is_cli
       and bool(target_enum)
       and target_id != model_name
       and float(route["confidence"]) >= min_conf
@@ -731,7 +835,13 @@ def handle_pre_invocation(
   did_switch = False
   auto_switch_fallback: str | None = None
 
-  if should_switch and not _verify_cascade_ownership(conv_id):
+  if (
+      mode == "auto_switch"
+      and bool(target_enum)
+      and target_id != model_name
+      and float(route["confidence"]) >= min_conf
+      and (is_cli or not _verify_cascade_ownership(conv_id))
+  ):
     should_switch = False
     did_switch = False
     auto_switch_fallback = "cascade_unowned"
@@ -787,13 +897,36 @@ def handle_pre_invocation(
     reroute_file.unlink(missing_ok=True)
     _save_json_state(seen_file, {"prompt_hash": prompt_hash})
 
+  # Only lock substantive non-lookup work onto flash/pro; preserve locked_task_class
+  # when thread_lock_applied held an earlier floor, and decay on standalone quick_lookup.
+  if route.get("thread_lock_applied") and thread_state:
+    persisted_task_class = str(
+        thread_state.get("locked_task_class") or route["task_class"]
+    )
+    persisted_tier = str(route["subagent_tier"])
+    persisted_model = str(route["recommended_model_id"])
+    persisted_think = int(route["thinking_level"])
+  elif str(route["task_class"]) == "quick_lookup":
+    persisted_task_class = "quick_lookup"
+    persisted_tier = "flash_lite"
+    persisted_model = str(
+        (cfg.get("tier_models") or {}).get("flash_lite")
+        or route["recommended_model_id"]
+    )
+    persisted_think = 1
+  else:
+    persisted_task_class = str(route["task_class"])
+    persisted_tier = str(route["subagent_tier"])
+    persisted_model = str(route["recommended_model_id"])
+    persisted_think = int(route["thinking_level"])
+
   _save_json_state(
       thread_file,
       {
-          "locked_tier": route["subagent_tier"],
-          "locked_model_id": route["recommended_model_id"],
-          "locked_thinking_level": route["thinking_level"],
-          "locked_task_class": route["task_class"],
+          "locked_tier": persisted_tier,
+          "locked_model_id": persisted_model,
+          "locked_thinking_level": persisted_think,
+          "locked_task_class": persisted_task_class,
           "turn_count_seen": turn_num,
       },
   )
@@ -807,12 +940,24 @@ def handle_pre_invocation(
       },
   )
 
+  cli_sys_msg = (
+      _build_cli_system_instruction(route)
+      if (
+          is_cli
+          and bool(cfg.get("cli_inline_banner", True))
+          and verbosity != "silent"
+      )
+      else ""
+  )
+
   telemetry_event: dict[str, Any] = {
       "ts": datetime.now(timezone.utc).isoformat(),
       "event": "PreInvocation",
       "prompt": _prompt_preview(cleaned),
       "mode": mode,
       "did_auto_switch": did_switch,
+      "thread_lock_applied": bool(route.get("thread_lock_applied")),
+      "cli_banner_injected": bool(cli_sys_msg),
       "current_model": model_name,
       "recommended_model_id": route["recommended_model_id"],
       "subagent_tier": route["subagent_tier"],
@@ -829,7 +974,12 @@ def handle_pre_invocation(
   if did_switch:
     return {"terminationBehavior": "terminate"}
 
-  return _make_inject_steps(render_info, user_md, verbosity=verbosity)
+  return _make_inject_steps(
+      render_info,
+      user_md,
+      verbosity=verbosity,
+      cli_system_message=cli_sys_msg,
+  )
 
 
 def handle_pre_tool_use(
@@ -1409,6 +1559,10 @@ def _cmd_set_mode(ns: argparse.Namespace) -> int:
     updates["min_confidence"] = float(ns.min_confidence)
   if getattr(ns, "verbosity", None) is not None:
     updates["verbosity"] = ns.verbosity
+  if getattr(ns, "enable_thread_floor", None) is not None:
+    updates["enable_thread_floor"] = bool(ns.enable_thread_floor)
+  if getattr(ns, "cli_inline_banner", None) is not None:
+    updates["cli_inline_banner"] = bool(ns.cli_inline_banner)
   cfg = save_router_config(updates)
   sys.stdout.write(
       json.dumps({"status": "updated", "router_config": cfg}, indent=2) + "\n"
@@ -1424,6 +1578,37 @@ def _cmd_set_verbosity(ns: argparse.Namespace) -> int:
   return 0
 
 
+def _format_action_and_reason(r: Mapping[str, Any]) -> tuple[str, str]:
+  """Returns crystal-clear (action_label, reason_label) for watch and stats."""
+  fallback = str(r.get("auto_switch_fallback") or "").strip()
+  if "PreToolUse" in str(r.get("event") or ""):
+    action = "ROUTE"
+  elif r.get("did_auto_switch"):
+    action = "SWITCH"
+  elif fallback == "cascade_unowned":
+    action = "CLI-ADVISE"
+  elif fallback:
+    action = "FALLBACK"
+  else:
+    action = "ADVISE"
+
+  raw_backend = str(r.get("backend") or "?").strip()
+  if raw_backend.startswith("thread_lock"):
+    base_reason = "thread_lock"
+  elif raw_backend.startswith("fast_rules"):
+    base_reason = "fast_rules"
+  elif raw_backend.startswith("lexical_fallback"):
+    base_reason = "lexical_fallback"
+  else:
+    base_reason = raw_backend
+
+  if r.get("thread_lock_applied") and base_reason != "thread_lock":
+    reason = f"{base_reason}+thread_lock"
+  else:
+    reason = base_reason
+  return action, reason
+
+
 def _format_watch_line(r: dict[str, Any], *, verbosity: str) -> str:
   ts = str(r.get("ts") or "")[11:19] or "--:--:--"
   ev = "SUB" if "PreToolUse" in str(r.get("event") or "") else "TURN"
@@ -1437,22 +1622,18 @@ def _format_watch_line(r: dict[str, Any], *, verbosity: str) -> str:
       else "?%"
   )
   fallback = r.get("auto_switch_fallback")
-  sw = (
-      "SWITCH"
-      if r.get("did_auto_switch")
-      else ("FALLBACK" if fallback else "ADVISE")
-  )
+  sw, reason = _format_action_and_reason(r)
   prompt = _prompt_preview(str(r.get("prompt") or ""), max_len=72)
 
   if verbosity == "compact":
     return (
         f"  [{ts}] {ev} {sw} -> {target} [{tier}]"
-        f" ({conf_str} | {lat} ms)  {prompt}"
+        f" ({conf_str} | {lat} ms | reason={reason})  {prompt}"
     )
 
   lines = [
-      f"  [{ts}] {ev:<4} {sw:<8} -> {target:<22} [{tier:<10}]"
-      f" ({conf_str} | {lat:>3} ms)"
+      f"  [{ts}] {ev:<4} {sw:<10} -> {target:<22} [{tier:<10}]"
+      f" ({conf_str} | {lat:>3} ms | reason={reason})"
   ]
   if prompt:
     lines.append(f'           prompt: "{prompt}"')
@@ -1461,6 +1642,7 @@ def _format_watch_line(r: dict[str, Any], *, verbosity: str) -> str:
         f"           from={r.get('current_model', 'auto')}"
         f"  task={r.get('task_class', '?')}"
         f"  backend={r.get('backend', '?')}"
+        f"  thread_lock={bool(r.get('thread_lock_applied'))}"
     )
     if fallback:
       detail += f"  fallback={fallback}"
@@ -1585,10 +1767,11 @@ def _format_stats_pretty(
     tier = str(r.get("subagent_tier") or r.get("assigned_tier") or "?")
     backend = str(r.get("backend") or "?")
     lat = r.get("latency_ms", 0)
-    sw = "SWITCH" if r.get("did_auto_switch") else "ADVISE"
+    sw, reason = _format_action_and_reason(r)
     prompt = _prompt_preview(str(r.get("prompt") or ""), max_len=72)
     lines.append(
-        f"  [{ts}] {ev:<4} {sw:<6} -> {target:<22} [{tier:<10}] {lat:>3} ms"
+        f"  [{ts}] {ev:<4} {sw:<10} -> {target:<22} [{tier:<10}]"
+        f" {lat:>3} ms (reason={reason})"
     )
     if prompt:
       lines.append(f'           prompt: "{prompt}"')
@@ -1753,6 +1936,20 @@ def main() -> int:
   p_mode.add_argument("--min-confidence", type=float, default=None)
   p_mode.add_argument(
       "--verbosity", choices=list(VALID_VERBOSITY_LEVELS), default=None
+  )
+  p_mode.add_argument(
+      "--enable-thread-floor",
+      dest="enable_thread_floor",
+      action=argparse.BooleanOptionalAction,
+      default=None,
+      help="Enable or disable asymmetric Turn 2+ thread floor.",
+  )
+  p_mode.add_argument(
+      "--cli-inline-banner",
+      dest="cli_inline_banner",
+      action=argparse.BooleanOptionalAction,
+      default=None,
+      help="Enable or disable 1-line inline routing badge inside agy CLI.",
   )
 
   p_verb = sub.add_parser("set-verbosity")

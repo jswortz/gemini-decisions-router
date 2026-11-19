@@ -29,6 +29,15 @@ import router_hook  # noqa: E402
 def test_zero_internal_google_references() -> None:
   """Ensures no internal APIs, endpoints, CLIs, or shortlinks appear in repo."""
   forbidden_tokens = [
+      "gemini-4-" + "carbon",
+      "gemini-4-" + "hydrogen",
+      "gemini-4-" + "argon",
+      "gemini-4-" + "neon",
+      "gemini-" + "3.8",
+      "gemini-" + "3.7",
+      "gemini-" + "3.6",
+      "hydrogen-" + "l-tf",
+      "//" + "depot/",
       "be" + "yond",
       "stu" + "bby",
       "bl" + "ade:",
@@ -39,6 +48,12 @@ def test_zero_internal_google_references() -> None:
       "lo" + "as2",
       "geel" + "inux",
       ".corp." + "google",
+      "/usr/local/" + "google",
+      "wortz-" + "project",
+      "down" + "shifter",
+      "ken" + "limmj",
+      "AIza" + "Sy",
+      "ya" + "29.",
       "http://" + "go/",
       "http://" + "cl/",
       "http://" + "b/",
@@ -1072,7 +1087,7 @@ def test_user_markdown_inline_banners_and_four_verbosity_levels(
   assert sub_silent == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
   assert "reason" not in sub_silent
 
-  # 2. compact, normal, verbose: 0 model tokens + metadata.user_markdown populated
+  # 2. compact, normal, verbose: 0 model tokens in Desktop App + panic-safe renderInfo
   for level in ("compact", "normal", "verbose"):
     router_hook.save_router_config(
         {"mode": "advisor", "verbosity": level}, config_path=cfg_path
@@ -1089,7 +1104,8 @@ def test_user_markdown_inline_banners_and_four_verbosity_levels(
     )
     sys_msg = out["injectSteps"][0]["systemMessage"]
     assert sys_msg["systemMessage"] == ""
-    user_md = sys_msg["metadata"]["user_markdown"]
+    assert "metadata" not in sys_msg
+    user_md = sys_msg["renderInfo"]["markdown"]
     assert "routed with intent" in user_md.lower()
     if level == "compact":
       assert "Routed with Intent" in user_md
@@ -1163,10 +1179,11 @@ def test_advisor_deduplicates_multi_step_tool_loops(
       route_fn=counting_route,
   )
   assert "injectSteps" in step1
+  assert "metadata" not in step1["injectSteps"][0]["systemMessage"]
   assert (
       "routed with intent"
-      in step1["injectSteps"][0]["systemMessage"]["metadata"][
-          "user_markdown"
+      in step1["injectSteps"][0]["systemMessage"]["renderInfo"][
+          "markdown"
       ].lower()
   )
   assert len(route_calls) == 1
@@ -1256,7 +1273,8 @@ def test_auto_switch_preflight_falls_back_to_advisor_when_cli_unowned(
   assert spawned == []
   sys_msg = out["injectSteps"][0]["systemMessage"]
   assert sys_msg["systemMessage"] == ""
-  assert "routed with intent" in sys_msg["metadata"]["user_markdown"].lower()
+  assert "metadata" not in sys_msg
+  assert "routed with intent" in sys_msg["renderInfo"]["markdown"].lower()
   assert sys_msg["renderInfo"]["title"].startswith("Recommended:")
 
   rows = [
@@ -1821,8 +1839,8 @@ def test_benchmark_suite_dataset_mock_runner_and_live_results(
 
   # 3. Validate live results_100.json invariants, secret hygiene, and PNG header
   raw_live = results_path.read_text(encoding="utf-8")
-  assert "AIza" not in raw_live
-  assert "ya29." not in raw_live
+  assert ("AIza" + "Sy") not in raw_live
+  assert ("ya" + "29.") not in raw_live
   live_res = json.loads(raw_live)
   assert live_res["metadata"]["mode"] == "live"
   assert live_res["metadata"]["dataset_size"] == 100
@@ -1860,3 +1878,287 @@ def test_docs_contain_no_em_or_en_dashes() -> None:
     text = doc.read_text(encoding="utf-8")
     assert "\u2014" not in text, f"Em-dash found in {doc}"
     assert "\u2013" not in text, f"En-dash found in {doc}"
+
+
+def test_smart_thread_floor_quick_lookup_unlock_and_config(
+    tmp_path: pathlib.Path,
+) -> None:
+  """Verifies conceptual quick_lookup threshold, smart thread_lock, and config."""
+  def fake_decision(call_args: dict[str, Any], _cfg: Any) -> dict[str, Any]:
+    txt = str(call_args["input"][-1]["text"]).lower()
+    if "navier stokes" in txt:
+      return {
+          "backend": "gemini_api",
+          "model": "gemini-decision-1",
+          "latency_ms": 190,
+          "answers": {
+              "task_class": {
+                  "choice": "quick_lookup",
+                  "confidence": 0.8516,
+                  "probabilities": {"quick_lookup": 0.8238, "writing_docs": 0.14},
+              },
+              "needs_pro_reasoning": {"noul": 0.049, "confidence": 0.95},
+              "effort_rubric": {"score": 1.037, "confidence": 0.82},
+          },
+      }
+    if (
+        "weather in chicago" in txt
+        or "lexical baseline" in txt
+        or "go ahead" in txt
+    ):
+      return {
+          "backend": "gemini_api",
+          "model": "gemini-decision-1",
+          "latency_ms": 180,
+          "answers": {
+              "task_class": {
+                  "choice": "quick_lookup",
+                  "confidence": 0.93,
+                  "probabilities": {"quick_lookup": 0.99},
+              },
+              "needs_pro_reasoning": {"noul": 0.01, "confidence": 0.98},
+              "effort_rubric": {"score": 0.35, "confidence": 0.94},
+          },
+      }
+    return {
+        "backend": "gemini_api",
+        "model": "gemini-decision-1",
+        "latency_ms": 210,
+        "answers": {
+            "task_class": {
+                "choice": "coding_edit",
+                "confidence": 0.91,
+                "probabilities": {"coding_edit": 0.94},
+            },
+            "needs_pro_reasoning": {"noul": 0.12, "confidence": 0.90},
+            "effort_rubric": {"score": 1.65, "confidence": 0.88},
+        },
+    }
+
+  # 1. Conceptual quick_lookup (eff_score ~1.04, p_pro < 0.25) routes to flash_lite
+  r_navier = decisions_engine.route_prompt(
+      "tell me about the navier stokes theorem",
+      decision_fn=fake_decision,
+      environ={},
+  )
+  assert r_navier["task_class"] == "quick_lookup"
+  assert r_navier["subagent_tier"] == "flash_lite"
+
+  # 2. A stale thread_state with locked_task_class == "quick_lookup" NEVER locks flash
+  stale_quick_thread = {
+      "locked_tier": "flash",
+      "locked_model_id": "gemini-3-flash",
+      "locked_thinking_level": 2,
+      "locked_task_class": "quick_lookup",
+  }
+  r_weather = decisions_engine.route_prompt(
+      "what is the current weather in chicago",
+      user_turn_count=2,
+      thread_state=stale_quick_thread,
+      decision_fn=fake_decision,
+      environ={},
+  )
+  assert r_weather["subagent_tier"] == "flash_lite"
+  assert r_weather["thread_lock_applied"] is False
+
+  # 3. Short standalone question (<=5 words with '?') is NOT hijacked by Tier 0 continuation
+  pro_thread = {
+      "locked_tier": "pro",
+      "locked_model_id": "gemini-3.1-pro-high",
+      "locked_thinking_level": 3,
+      "locked_task_class": "deep_debug_architecture",
+  }
+  r_short_q = decisions_engine.route_prompt(
+      "what is lexical baseline?",
+      user_turn_count=2,
+      thread_state=pro_thread,
+      decision_fn=fake_decision,
+      environ={},
+  )
+  assert r_short_q["subagent_tier"] == "flash_lite"
+  assert r_short_q["thread_lock_applied"] is False
+  assert r_short_q["backend"] == "gemini_api"
+
+  # 4. Genuine short continuations ("yes go ahead", "do step 2 next") still hold pro floor
+  for cont_prompt in ("yes go ahead", "do step 2 next"):
+    r_cont = decisions_engine.route_prompt(
+        cont_prompt,
+        user_turn_count=2,
+        thread_state=pro_thread,
+        decision_fn=fake_decision,
+        environ={},
+    )
+    assert r_cont["subagent_tier"] == "pro"
+    assert r_cont["thread_lock_applied"] is True
+
+  # 5. enable_thread_floor=False disables asymmetric floor via router_config.json & MCP
+  cfg_path = tmp_path / "router_config.json"
+  srv = mcp_server.McpServer(config_path=cfg_path)
+  cfg_resp = json.loads(
+      srv.handle_line(
+          json.dumps({
+              "jsonrpc": "2.0",
+              "id": 77,
+              "method": "tools/call",
+              "params": {
+                  "name": "configure_router",
+                  "arguments": {"enable_thread_floor": False},
+              },
+          }).encode("utf-8")
+      ).decode("utf-8")
+  )
+  assert cfg_resp["result"]["isError"] is False
+  assert router_hook.load_router_config(cfg_path)["enable_thread_floor"] is False
+
+  r_disabled_floor = decisions_engine.route_prompt(
+      "yes go ahead",
+      user_turn_count=2,
+      thread_state=pro_thread,
+      enable_thread_floor=False,
+      decision_fn=fake_decision,
+      environ={},
+  )
+  assert r_disabled_floor["subagent_tier"] == "flash_lite"
+  assert r_disabled_floor["thread_lock_applied"] is False
+
+
+def test_agy_cli_inline_banner_detection_and_toggle(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Verifies agy CLI detection, 1-line inline routing badge, and toggle."""
+  monkeypatch.delenv("ANTIGRAVITY_VSCODE_HOST", raising=False)
+  monkeypatch.delenv("GEMINI_DECISIONS_CLI_MODE", raising=False)
+
+  cli_hook_input = {
+      "conversationId": "cli-banner-conv-1",
+      "invocationNum": 0,
+      "modelName": "auto",
+      "lastUserInput": "ship it",
+      "transcriptPath": str(
+          tmp_path / ".gemini" / "antigravity-cli" / "brain" / "c1" / "transcript.jsonl"
+      ),
+  }
+  desktop_hook_input = {
+      "conversationId": "desktop-banner-conv-1",
+      "invocationNum": 1,
+      "modelName": "auto",
+      "lastUserInput": "ship it",
+      "transcriptPath": str(
+          tmp_path / ".gemini" / "antigravity" / "brain" / "d1" / "transcript.jsonl"
+      ),
+  }
+
+  assert router_hook._is_agy_cli_environment(cli_hook_input) is True
+  assert router_hook._is_agy_cli_environment(desktop_hook_input) is False
+
+  cfg_path = tmp_path / "router_config.json"
+  router_hook.save_router_config(
+      {"mode": "advisor", "verbosity": "normal", "cli_inline_banner": True},
+      config_path=cfg_path,
+  )
+
+  # Step 1 in agy CLI injects the 1-line routing badge instruction in systemMessage
+  out_cli = router_hook.handle_pre_invocation(
+      cli_hook_input, state_dir=tmp_path, config_path=cfg_path
+  )
+  sys_msg = out_cli["injectSteps"][0]["systemMessage"]
+  assert "metadata" not in sys_msg
+  assert "> ✦ **Routed with Intent** -> `" in sys_msg["systemMessage"]
+  assert "[Low]" in sys_msg["systemMessage"]
+
+  # Step 2 (tool loop deduplication) returns {} so badge is never duplicated
+  out_cli_step2 = router_hook.handle_pre_invocation(
+      cli_hook_input, state_dir=tmp_path, config_path=cfg_path
+  )
+  assert out_cli_step2 == {}
+
+  # Desktop App keeps systemMessage == "" (0 model tokens)
+  out_desktop = router_hook.handle_pre_invocation(
+      desktop_hook_input, state_dir=tmp_path, config_path=cfg_path
+  )
+  assert out_desktop["injectSteps"][0]["systemMessage"]["systemMessage"] == ""
+
+  # Toggling cli_inline_banner=False via MCP configure_router suppresses CLI prompt tokens
+  srv = mcp_server.McpServer(config_path=cfg_path)
+  resp = json.loads(
+      srv.handle_line(
+          json.dumps({
+              "jsonrpc": "2.0",
+              "id": 88,
+              "method": "tools/call",
+              "params": {
+                  "name": "configure_router",
+                  "arguments": {"cli_inline_banner": False},
+              },
+          }).encode("utf-8")
+      ).decode("utf-8")
+  )
+  assert resp["result"]["isError"] is False
+  cli_hook_turn2 = dict(cli_hook_input, lastUserInput="lgtm")
+  out_cli_off = router_hook.handle_pre_invocation(
+      cli_hook_turn2, state_dir=tmp_path, config_path=cfg_path
+  )
+  assert out_cli_off["injectSteps"][0]["systemMessage"]["systemMessage"] == ""
+
+
+def test_watch_and_stats_action_and_reason_labels() -> None:
+  """Verifies ADVISE, CLI-ADVISE, SWITCH, and reason= labels in watch & stats."""
+  events = [
+      {
+          "ts": "2026-11-19T02:39:22+00:00",
+          "event": "PreInvocation",
+          "prompt": "What is 2+2?",
+          "mode": "advisor",
+          "did_auto_switch": False,
+          "recommended_model_id": "gemini-3.1-flash-lite",
+          "subagent_tier": "flash_lite",
+          "confidence": 0.96,
+          "latency_ms": 180,
+          "backend": "gemini_api",
+          "thread_lock_applied": False,
+      },
+      {
+          "ts": "2026-11-19T02:40:01+00:00",
+          "event": "PreInvocation",
+          "prompt": "Design consensus protocol",
+          "mode": "auto_switch",
+          "did_auto_switch": False,
+          "auto_switch_fallback": "cascade_unowned",
+          "recommended_model_id": "gemini-3.1-pro-high",
+          "subagent_tier": "pro",
+          "confidence": 0.94,
+          "latency_ms": 220,
+          "backend": "gemini_api",
+          "thread_lock_applied": False,
+      },
+      {
+          "ts": "2026-11-19T02:40:15+00:00",
+          "event": "PreInvocation",
+          "prompt": "yes go ahead",
+          "mode": "auto_switch",
+          "did_auto_switch": True,
+          "recommended_model_id": "gemini-3.1-pro-high",
+          "subagent_tier": "pro",
+          "confidence": 0.92,
+          "latency_ms": 1,
+          "backend": "thread_lock (<1 ms)",
+          "thread_lock_applied": True,
+      },
+  ]
+  w0 = router_hook._format_watch_line(events[0], verbosity="normal")
+  w1 = router_hook._format_watch_line(events[1], verbosity="normal")
+  w2 = router_hook._format_watch_line(events[2], verbosity="normal")
+  assert "ADVISE" in w0 and "reason=gemini_api" in w0
+  assert "CLI-ADVISE" in w1 and "reason=gemini_api" in w1
+  assert "SWITCH" in w2 and "reason=thread_lock" in w2
+
+  stats_txt = router_hook._format_stats_pretty(
+      events,
+      by_tier={"flash_lite": 1, "pro": 2},
+      avg_ms=134,
+      verbosity="normal",
+  )
+  assert "CLI-ADVISE" in stats_txt
+  assert "SWITCH" in stats_txt
+  assert "reason=thread_lock" in stats_txt
+  assert "reason=gemini_api" in stats_txt

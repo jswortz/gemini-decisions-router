@@ -188,6 +188,20 @@ _CONFIGURE_ROUTER_TOOL: dict[str, Any] = {
                     "Enable PreToolUse tier routing on invoke_subagent calls."
                 ),
             },
+            "enable_thread_floor": {
+                "type": "boolean",
+                "description": (
+                    "Enable asymmetric Turn 2+ thread floor for coding/pro"
+                    " threads (default: true)."
+                ),
+            },
+            "cli_inline_banner": {
+                "type": "boolean",
+                "description": (
+                    "Render a concise 1-line routing badge inside agy CLI"
+                    " responses when verbosity != silent (default: true)."
+                ),
+            },
             "tier_models": {
                 "type": "object",
                 "additionalProperties": False,
@@ -216,6 +230,8 @@ _ALLOWED_CONFIGURE_KEYS = frozenset({
     "verbosity",
     "min_confidence",
     "enable_subagent_routing",
+    "enable_thread_floor",
+    "cli_inline_banner",
     "tier_models",
 })
 
@@ -280,6 +296,15 @@ def _validate_configure_args(arguments: Mapping[str, Any]) -> dict[str, Any]:
           "enable_subagent_routing must be a boolean"
       )
     updates["enable_subagent_routing"] = esr
+
+  for bool_key in ("enable_thread_floor", "cli_inline_banner"):
+    if bool_key in arguments:
+      bval = arguments[bool_key]
+      if not isinstance(bval, bool):
+        raise decisions_engine.InvalidInputError(
+            f"{bool_key} must be a boolean"
+        )
+      updates[bool_key] = bval
 
   if "tier_models" in arguments:
     tm = arguments["tier_models"]

@@ -2035,7 +2035,9 @@ def discover_models_from_ls(
       os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
   )
   env_csrf = (
-      csrf_token or os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
+      csrf_token
+      or os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
+      or os.environ.get("ANTIGRAVITY_SERVER_CSRF_TOKEN", "")
   ).strip()
   if env_addr:
     attempts.append((env_addr, env_csrf))
@@ -2524,6 +2526,12 @@ _EXPLICIT_MODEL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:use|run)\s+(?:claude|opus)\b", re.I), "pro"),
 )
 
+_STANDALONE_QUESTION_START_RE = re.compile(
+    r"^(?:what|why|how|who|where|when|which|is|are|can|could|does|"
+    r"do\s+you|tell\s+me|explain|define)\b",
+    re.I,
+)
+
 _ROUTER_QUESTIONS: dict[str, Any] = {
     "task_class": {
         "type": "choice",
@@ -2619,21 +2627,67 @@ def _build_route_dict(
   }
 
 
+def _has_active_thread_floor(
+    thread_state: Mapping[str, Any] | None,
+) -> bool:
+  """Returns True only when prior turns established a non-lookup work floor."""
+  if not thread_state:
+    return False
+  locked_tier = str(thread_state.get("locked_tier") or "")
+  if locked_tier not in ("flash", "pro"):
+    return False
+  locked_task = str(thread_state.get("locked_task_class") or "").strip()
+  if locked_task == "quick_lookup":
+    return False
+  return True
+
+
+def _is_standalone_quick_lookup(
+    prompt_text: str, candidate: Mapping[str, Any]
+) -> bool:
+  """Detects high-confidence standalone quick_lookup turns that unlock floor."""
+  if str(candidate.get("task_class") or "") != "quick_lookup":
+    return False
+  if float(candidate.get("confidence", 0.0)) <= 0.85:
+    return False
+  cleaned = re.sub(r"\s+", " ", prompt_text or "").strip()
+  low = cleaned.lower().rstrip(".!")
+  if not cleaned or low in _THREAD_CONTINUATIONS:
+    return False
+  probs = candidate.get("probabilities") or {}
+  tc_probs = probs.get("task_class") if isinstance(probs, Mapping) else {}
+  ql_prob = (
+      float(tc_probs.get("quick_lookup", 0.0))
+      if isinstance(tc_probs, Mapping)
+      else 0.0
+  )
+  if "?" in cleaned or _STANDALONE_QUESTION_START_RE.search(cleaned):
+    return True
+  return ql_prob > 0.85 and len(low.split()) >= 5
+
+
 def _apply_thread_floor(
     candidate: dict[str, Any],
     *,
     user_turn_count: int,
     thread_state: Mapping[str, Any] | None,
     tier_models: Mapping[str, str] | None = None,
+    enable_thread_floor: bool = True,
+    prompt_text: str = "",
 ) -> dict[str, Any]:
-  """Prevents mid-thread model downgrades on Turn 2+ unless user overrode."""
+  """Prevents mid-thread downgrades on coding/architecture threads unless unlocked."""
   if (
-      user_turn_count < 2
-      or not thread_state
+      not enable_thread_floor
+      or user_turn_count < 2
       or candidate.get("explicit_model_requested")
+      or not _has_active_thread_floor(thread_state)
   ):
     return candidate
 
+  if _is_standalone_quick_lookup(prompt_text, candidate):
+    return candidate
+
+  assert thread_state is not None
   locked_tier = str(thread_state.get("locked_tier") or "")
   if locked_tier not in TIER_RANKS:
     return candidate
@@ -2670,6 +2724,7 @@ def _fast_rule_route(
     user_turn_count: int,
     thread_state: Mapping[str, Any] | None,
     tier_models: Mapping[str, str] | None = None,
+    enable_thread_floor: bool = True,
 ) -> dict[str, Any] | None:
   cleaned = re.sub(r"\s+", " ", prompt).strip()
   low = cleaned.lower().rstrip(".!")
@@ -2694,11 +2749,18 @@ def _fast_rule_route(
           tier_models=tier_models,
       )
 
+  is_short_continuation = low in _THREAD_CONTINUATIONS or (
+      len(words) <= 5
+      and "?" not in cleaned
+      and not _STANDALONE_QUESTION_START_RE.search(cleaned)
+  )
   if (
-      user_turn_count >= 2
-      and thread_state
-      and (low in _THREAD_CONTINUATIONS or len(words) <= 5)
+      enable_thread_floor
+      and user_turn_count >= 2
+      and _has_active_thread_floor(thread_state)
+      and is_short_continuation
   ):
+    assert thread_state is not None
     locked_tier = str(thread_state.get("locked_tier") or "flash")
     if locked_tier not in TIER_RANKS:
       locked_tier = "flash"
@@ -2859,6 +2921,7 @@ def route_prompt(
     prev_context: str = "",
     thread_state: Mapping[str, Any] | None = None,
     enable_fast_rules: bool = True,
+    enable_thread_floor: bool = True,
     ignore_cooldown: bool = False,
     cooldown_file: str | None = None,
     hook_timeout_s: float | None = None,
@@ -2891,6 +2954,7 @@ def route_prompt(
         user_turn_count=user_turn_count,
         thread_state=thread_state,
         tier_models=resolved_models,
+        enable_thread_floor=enable_thread_floor,
     )
     if fast is not None:
       return _apply_thread_floor(
@@ -2898,6 +2962,8 @@ def route_prompt(
           user_turn_count=user_turn_count,
           thread_state=thread_state,
           tier_models=resolved_models,
+          enable_thread_floor=enable_thread_floor,
+          prompt_text=text,
       )
 
   context_parts = []
@@ -2944,6 +3010,8 @@ def route_prompt(
         user_turn_count=user_turn_count,
         thread_state=thread_state,
         tier_models=resolved_models,
+        enable_thread_floor=enable_thread_floor,
+        prompt_text=text,
     )
 
   answers = dec["answers"]
@@ -2962,7 +3030,7 @@ def route_prompt(
   ):
     tier = "pro"
     thinking_level = 4 if (p_pro >= 0.88 and eff_score >= 2.75) else 3
-  elif task_class == "quick_lookup" and p_pro < 0.25 and eff_score < 0.85:
+  elif task_class == "quick_lookup" and p_pro < 0.25 and eff_score < 1.15:
     tier = "flash_lite"
     thinking_level = 1
   else:
@@ -2998,4 +3066,6 @@ def route_prompt(
       user_turn_count=user_turn_count,
       thread_state=thread_state,
       tier_models=resolved_models,
+      enable_thread_floor=enable_thread_floor,
+      prompt_text=text,
   )

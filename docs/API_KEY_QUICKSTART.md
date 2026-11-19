@@ -77,13 +77,15 @@ Expected output from `agy-router auth-check --live`:
 
 ## 3. How to See Which Route Was Taken (App & CLI)
 
-### A. Inline Zero-Token `"✦ Routed with Intent"` Banners (`metadata.user_markdown`)
+### A. Inline `"✦ Routed with Intent"` Banners (Desktop App & `agy` CLI)
 
 Every explicit user prompt triggers `PreInvocation`:
-1. **Tier 0 (`<1 ms`):** Local fast rules classify confirmations (`"yes"`, `"ship it"`), explicit model requests (`"use gemini pro"`), crash markers, and Turn 2+ asymmetric thread floors (preventing mid-thread downgrades from `pro` to `flash_lite`).
+1. **Tier 0 (`<1 ms`):** Local fast rules classify confirmations (`"yes"`, `"ship it"`), explicit model requests (`"use gemini pro"`), crash markers, and smart Turn 2+ asymmetric thread floors (preserving `pro` and `coding_edit` floors on continuations while never locking `flash` on standalone `quick_lookup` questions).
 2. **Tier 1 (`~180-350 ms`, 0 output tokens, `1.5s` hook deadline):** Sends a single `CreateDecision` call to `gemini-decision-1` scoring `task_class` (`choice`), `needs_pro_reasoning` (`noul`), and `effort_rubric` (`score`).
 
-To ensure universal visibility across both the **Antigravity Desktop App** and **`agy` CLI**, the hook populates `injectSteps[0].systemMessage.metadata.user_markdown` (alongside `renderInfo`) while keeping `systemMessage.systemMessage` set to `""` (**0 model context tokens**).
+Visibility works automatically across both surfaces:
+- **Antigravity Desktop App (0 Model Tokens):** Renders a collapsible `"✦ Routed with Intent"` UI card via `renderInfo` with `"systemMessage": ""` (0 prompt tokens; `metadata` map fields are intentionally omitted for protobuf scrubber safety).
+- **`agy` CLI (`cli_inline_banner: true` by default):** Because `agy` CLI suppresses empty-message UI steps, `router_hook.py` automatically detects `agy` CLI (`/.gemini/antigravity-cli/` or `agy` parent process) and, when `verbosity != "silent"`, injects a concise 1-line badge instruction on Step 1 so the assistant begins its reply with `> ✦ **Routed with Intent** -> \`<model>\` [<thinking>] · <conf>% · <ms> ms`. Toggle anytime via `"cli_inline_banner": false` in `router_config.json`, `agy-router set-mode advisor --no-cli-inline-banner`, or `GEMINI_DECISIONS_CLI_INLINE_BANNER=0`.
 
 When an agent spawns a helper via `invoke_subagent` with `Model` unset or `"inherit"`, the `PreToolUse` hook right-sizes `Model` to `flash_lite`, `flash`, or `pro` and displays an inline tool notice:
 `✦ Routed with Intent -> subagent Model=flash_lite (95% | 180 ms)` (omitted when verbosity is `silent`).
